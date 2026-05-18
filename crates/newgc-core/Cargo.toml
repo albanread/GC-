@@ -1,0 +1,34 @@
+[package]
+name = "newgc-core"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "Page-based mark-evacuate generational GC, extracted from NewCormanLisp's page-heap"
+
+[features]
+default = ["conservative-pin"]
+# Conservative stack-pin scanner. Required by clients that can't
+# enumerate precise roots (typical for tree-walking interpreters or
+# JITs without statepoint stack maps). Costs ~450 lines of code,
+# one extra HashSet on `PageHeap`, and a per-cycle scan when the
+# client invokes it.
+#
+# Disable for precise-root-only clients (e.g. OpenDylan with
+# `gc.statepoint`) to compile the pin machinery out entirely:
+#   cargo build --no-default-features
+conservative-pin = []
+
+[dependencies]
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

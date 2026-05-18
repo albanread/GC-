@@ -1,0 +1,27 @@
+# Rust build artifacts
+/target
+**/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Profiling / coredumps
+*.profraw
+*.profdata
+perf.data
+perf.data.old
+core
+core.*
+vgcore.*
+
+# Local scratch
+/scratch/
+*.local.md

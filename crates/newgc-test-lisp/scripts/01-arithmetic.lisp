@@ -1,0 +1,10 @@
+; Basic arithmetic and control flow. No allocation.
+(check-equal 15 (+ 1 2 3 4 5))
+(check-equal 5 (- 10 3 2))
+(check-equal 24 (* 2 3 4))
+(check-equal -7 (- 7))
+(check-equal 0 (if #f 1 0))
+(check-equal 1 (if #t 1 0))
+(assert (= 1 1))
+(assert (< 1 2))
+(check-equal 5 (begin 1 2 3 4 5))
