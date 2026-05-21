@@ -1032,3 +1032,200 @@ fn stochastic_collect_full_session_seed_99() {
     // Tenured must never grow unboundedly.
     run_workload_with_full_gc(99, 128 * 64 * 1024, 3_000);
 }
+
+// =========================================================================
+// Blended workload: all shapes, configurable GC policy, drain verification
+// =========================================================================
+
+/// Run the fully blended stochastic workload.
+///
+/// All six shape variants (cons, vector, large vector, string, tree,
+/// small-cons) are active together. On each major-GC event,
+/// `full_gc_percent` (0–100) controls how often `collect_full` fires
+/// instead of a regular major cycle.
+///
+/// After the run, all roots are cleared and `collect_full` is called
+/// once with an empty root closure. This "drain" must leave all three
+/// generations completely empty — including any large objects that
+/// promoted to Tenured during the workload. The assertion catches leaks
+/// that survive a full cycle with no reachable objects.
+fn run_blended(seed: u64, reservation_bytes: usize, n_ops: usize, full_gc_percent: u32) {
+    let mut w = Workload::with_large_objects(seed, reservation_bytes);
+    let verify_every = 50;
+
+    for _ in 0..n_ops {
+        w.step += 1;
+        w.stats.ops += 1;
+        w.advance_function_returns();
+        w.advance_tracked_deaths();
+
+        let op_kind = w.rng.weighted_choice(&[
+            12, // enter_function
+            18, // alloc_random_local
+            10, // alloc_random_tracked
+            5,  // drop_random_tracked
+            8,  // minor_gc
+            2,  // major_gc or full_gc
+            2,  // verify integrity
+        ]);
+        match op_kind {
+            0 => w.enter_function(),
+            1 => {
+                if w.frames.is_empty() {
+                    w.enter_function();
+                }
+                w.alloc_random_local();
+            }
+            2 => w.alloc_random_tracked(),
+            3 => w.drop_random_tracked(),
+            4 => w.minor_gc(),
+            5 => {
+                if w.rng.percent(full_gc_percent) {
+                    w.full_gc();
+                } else {
+                    w.major_gc();
+                }
+            }
+            6 => {
+                w.verify_all_tracked().expect("integrity check failed");
+                w.stats.integrity_checks += 1;
+            }
+            _ => unreachable!(),
+        }
+
+        if w.stats.ops % verify_every == 0 {
+            if let Err(msg) = w.verify_all_tracked() {
+                panic!(
+                    "integrity failure at step={}, seed={seed}: {}\nstats={:?}",
+                    w.step, msg, w.stats
+                );
+            }
+        }
+    }
+
+    // Final integrity sweep over surviving tracked objects.
+    if let Err(msg) = w.verify_all_tracked() {
+        panic!(
+            "final integrity failure at step={}, seed={seed}: {}\nstats={:?}",
+            w.step, msg, w.stats
+        );
+    }
+
+    eprintln!(
+        "run_blended: seed={seed}, n_ops={n_ops}, full_gc_pct={full_gc_percent}%, stats={:?}",
+        w.stats
+    );
+    eprintln!(
+        "  gc: {} minor + {} major + {} full; {} integrity checks",
+        w.stats.minor_cycles, w.stats.major_cycles,
+        w.stats.full_cycles, w.stats.integrity_checks
+    );
+
+    assert!(
+        w.stats.local_allocations + w.stats.tracked_allocations > n_ops / 10,
+        "workload didn't allocate enough (seed={seed})"
+    );
+    assert!(w.stats.minor_cycles > 5, "not enough minor cycles (seed={seed})");
+
+    // Drain: drop every root, then call collect_full with an empty visitor.
+    // All three generations must go to zero — this catches objects that
+    // survive a full cycle despite having no reachable roots, including
+    // large objects that aged into Tenured.
+    w.frames.clear();
+    w.tracked.clear();
+    w.heap.collect_full(|_evac| {});
+
+    assert_eq!(
+        w.heap.count_pages_in_gen(Generation::G0), 0,
+        "G0 non-empty after rootless collect_full drain (seed={seed})"
+    );
+    assert_eq!(
+        w.heap.count_pages_in_gen(Generation::G1), 0,
+        "G1 non-empty after rootless collect_full drain (seed={seed})"
+    );
+    assert_eq!(
+        w.heap.count_pages_in_gen(Generation::Tenured), 0,
+        "Tenured non-empty after rootless collect_full drain (seed={seed})"
+    );
+}
+
+// -------------------------------------------------------------------------
+// Blended seeds — 20 % full_gc, all shapes active.
+// Each seed exercises a different allocation-order / lifetime fingerprint.
+// -------------------------------------------------------------------------
+
+#[test]
+fn stochastic_blended_all_shapes_seed_13() {
+    // Baseline blended run. 20% full_gc exercises the three-pass
+    // collect_full code path in proportion with minor/major cycles.
+    run_blended(13, 256 * 64 * 1024, 5_000, 20);
+}
+
+#[test]
+fn stochastic_blended_all_shapes_seed_17() {
+    run_blended(17, 256 * 64 * 1024, 5_000, 20);
+}
+
+#[test]
+fn stochastic_blended_all_shapes_seed_31() {
+    run_blended(31, 256 * 64 * 1024, 5_000, 20);
+}
+
+// -------------------------------------------------------------------------
+// Heavy full-gc pressure — collect_full fires at 50 % of major-GC events.
+// Stresses Tenured→Tenured evacuation and large-object run-flip logic.
+// -------------------------------------------------------------------------
+
+#[test]
+fn stochastic_blended_heavy_full_gc_seed_42() {
+    // At 50% full_gc, the Tenured generation is collected twice as often
+    // as in the baseline, catching drift in the three-pass bookkeeping.
+    run_blended(42, 256 * 64 * 1024, 4_000, 50);
+}
+
+#[test]
+fn stochastic_blended_heavy_full_gc_seed_55() {
+    run_blended(55, 256 * 64 * 1024, 4_000, 50);
+}
+
+// -------------------------------------------------------------------------
+// All-GC-modes-equal — collect_full at 33%, giving roughly equal weight
+// to minor, major, and full across the run.
+// -------------------------------------------------------------------------
+
+#[test]
+fn stochastic_blended_all_gc_modes_equal_seed_2025() {
+    // 33% split means ~1/3 of major events become full collections.
+    // Combined with minors at weight 8 vs major at weight 2, the run
+    // exercises all three GC modes in realistic proportion.
+    run_blended(2025, 256 * 64 * 1024, 5_000, 33);
+}
+
+// -------------------------------------------------------------------------
+// Moderate heap pressure — 64-page reservation forces more frequent GC.
+// Large objects (each 2 pages) consume ~1/16 of the reservation per live
+// object; the GC must continuously recover pages to keep pace.
+// -------------------------------------------------------------------------
+
+#[test]
+fn stochastic_blended_moderate_pressure_seed_999() {
+    // 64 pages (4 MB). Large vectors at 2 pages each mean at most ~30
+    // can coexist; GC must reclaim promptly. Heap pressure validates that
+    // collect_full actually frees Tenured pages in a tight reservation.
+    run_blended(999, 64 * 64 * 1024, 3_000, 20);
+}
+
+// -------------------------------------------------------------------------
+// Long session — 15 000 ops simulates a sustained interactive session.
+// Objects reach max age, cohort promotion fires many times, and
+// collect_full must keep Tenured from growing without bound.
+// -------------------------------------------------------------------------
+
+#[test]
+fn stochastic_blended_long_session_seed_777() {
+    // 512-page (32 MB) heap gives room for the long run without false OOM.
+    // The drain assertion at the end proves collect_full reclaims
+    // everything once the root set is cleared, even after 15 K ops
+    // of accumulated promotion.
+    run_blended(777, 512 * 64 * 1024, 15_000, 15);
+}
