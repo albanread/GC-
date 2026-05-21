@@ -152,7 +152,7 @@ impl PageKind {
 ///   offset 7   kind               u8    (1 byte)
 ///   offset 8   pin_byte           u8    (1 byte)
 ///   offset 9   age                u8    (1 byte)
-///   offset 10  _pad               u16   (2 bytes)
+///   offset 10  n_span             u16   (2 bytes)
 ///   total                              = 12 bytes
 /// ```
 ///
@@ -189,10 +189,11 @@ pub struct PageDesc {
     /// the page flips to `gen.promoted()` after the next cycle.
     /// Reset to 0 on every page-state change.
     pub age: u8,
-    /// Reserved to pad PageDesc to 12 bytes, aligning the next
-    /// array element on a 4-byte boundary so `scan_start_offset`
-    /// of element N+1 stays naturally aligned.
-    _pad: u16,
+    /// For `PageKind::Cons` and `PageKind::Boxed` pages, always `1` (single-page
+    /// allocation). For `PageKind::Large` pages: `>= 1` on the head page (value =
+    /// number of pages in the run), `0` on continuation pages. `0` for `Free`
+    /// pages. Used by Sprint VM-1 large-object allocation and evacuation.
+    pub n_span: u16,
 }
 
 impl PageDesc {
@@ -205,7 +206,7 @@ impl PageDesc {
         kind: PageKind::Free,
         pin_byte: 0,
         age: 0,
-        _pad: 0,
+        n_span: 0,
     };
 
     /// Construct a fresh page descriptor for a page just assigned
@@ -220,7 +221,10 @@ impl PageDesc {
             kind,
             pin_byte: 0,
             age: 0,
-            _pad: 0,
+            n_span: match kind {
+                PageKind::Cons | PageKind::Boxed => 1,
+                _ => 0, // Free and Large start at 0; Large head pages set n_span explicitly after calling fresh()
+            },
         }
     }
 
@@ -253,6 +257,20 @@ impl PageDesc {
     pub fn is_pinned(&self, slot: u8) -> bool {
         debug_assert!(slot < 8, "pin slot {slot} out of range");
         self.pin_byte & (1 << slot) != 0
+    }
+
+    /// True if this page is the head of a large-object run.
+    /// Large-object head pages have `kind == Large` and `n_span >= 1`.
+    /// VM-1 large-object allocator sets `n_span` to the run length after
+    /// calling `fresh(gen, PageKind::Large)`.
+    pub fn is_large_head(&self) -> bool {
+        self.kind == PageKind::Large && self.n_span >= 1
+    }
+
+    /// True if this page is a continuation page of a large-object run.
+    /// Continuation pages have `kind == Large` and `n_span == 0`.
+    pub fn is_large_cont(&self) -> bool {
+        self.kind == PageKind::Large && self.n_span == 0
     }
 }
 
@@ -362,5 +380,36 @@ mod tests {
         d.scan_start_offset = 17;
         d.release();
         assert_eq!(d, PageDesc::FREE);
+    }
+
+    #[test]
+    fn n_span_is_zero_for_free_page() {
+        assert_eq!(PageDesc::FREE.n_span, 0);
+    }
+
+    #[test]
+    fn n_span_is_one_for_cons_and_boxed() {
+        assert_eq!(
+            PageDesc::fresh(Generation::G0, PageKind::Cons).n_span,
+            1
+        );
+        assert_eq!(
+            PageDesc::fresh(Generation::G1, PageKind::Boxed).n_span,
+            1
+        );
+    }
+
+    #[test]
+    fn large_head_and_cont_predicates() {
+        // A freshly-made Large page starts as a continuation (n_span=0).
+        let cont = PageDesc::fresh(Generation::G0, PageKind::Large);
+        assert!(!cont.is_large_head(), "fresh Large is not yet a head");
+        assert!(cont.is_large_cont(), "fresh Large is a continuation placeholder");
+
+        // After the VM-1 allocator sets n_span, it becomes a head.
+        let mut head = PageDesc::fresh(Generation::G0, PageKind::Large);
+        head.n_span = 4;
+        assert!(head.is_large_head());
+        assert!(!head.is_large_cont());
     }
 }

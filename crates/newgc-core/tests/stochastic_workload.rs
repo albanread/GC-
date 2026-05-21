@@ -33,8 +33,8 @@
 //!   walk validates every tracked structure's payload.
 
 use newgc_core::{
-    Generation, HeapHeader, HeapLayout, HeapType, LispLayout, PageHeap,
-    PAYLOAD_MASK, Tag, Word,
+    Generation, HeapHeader, HeapLayout, HeapType, LispLayout, PAGE_SIZE_CELLS,
+    PageHeap, PAYLOAD_MASK, Tag, Word,
 };
 
 // =========================================================================
@@ -174,6 +174,28 @@ fn string(h: &mut Heap, g: Generation, bytes: &[u8]) -> Word {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
     }
     Word::from_ptr(p.as_ptr() as *const u8, Tag::String)
+}
+
+/// Allocate a large vector using `try_alloc_large`. `n_payload` must
+/// produce a total cell count (1 + n_payload) that exceeds PAGE_SIZE_CELLS.
+fn alloc_large_vector(h: &mut Heap, g: Generation, n_payload: u32, seed: i64) -> Word {
+    let total = 1 + n_payload as usize;
+    debug_assert!(
+        total > PAGE_SIZE_CELLS,
+        "alloc_large_vector: total={total} <= PAGE_SIZE_CELLS; use vector() for small allocations"
+    );
+    let p = h.try_alloc_large(total, g).expect("large vector alloc");
+    unsafe {
+        (p.as_ptr() as *mut u64).write(
+            HeapHeader::new(HeapType::Vector, n_payload).raw(),
+        );
+        for i in 0..n_payload {
+            p.as_ptr().add(1 + i as usize).write(
+                Word::fixnum(seed.wrapping_add(i as i64)).raw(),
+            );
+        }
+    }
+    Word::from_ptr(p.as_ptr() as *const u8, Tag::Vector)
 }
 
 unsafe fn vector_slot(w: Word, idx: usize) -> Word {
@@ -415,6 +437,7 @@ struct Stats {
     random_drops: usize,
     minor_cycles: usize,
     major_cycles: usize,
+    full_cycles: usize,
     integrity_checks: usize,
     peak_frames: usize,
     peak_tracked: usize,
@@ -429,6 +452,10 @@ struct Workload {
     next_id: usize,
     step: usize,
     stats: Stats,
+    /// When true, `alloc_random_with_shape` may allocate `LargeVector`
+    /// objects using `try_alloc_large`. Set only when the reservation is
+    /// large enough to accommodate them (~128 pages minimum).
+    enable_large_objects: bool,
 }
 
 impl Workload {
@@ -441,7 +468,14 @@ impl Workload {
             next_id: 0,
             step: 0,
             stats: Stats::default(),
+            enable_large_objects: false,
         }
+    }
+
+    fn with_large_objects(seed: u64, reservation_bytes: usize) -> Self {
+        let mut w = Self::new(seed, reservation_bytes);
+        w.enable_large_objects = true;
+        w
     }
 
     // -- Frame / function-call management ----------------------------------
@@ -559,14 +593,14 @@ impl Workload {
     }
 
     fn alloc_random_with_shape(&mut self) -> (Word, Shape) {
-        let kind = self.rng.weighted_choice(&[
-            25, // List
-            25, // Vector
-            10, // LargeVector
-            20, // Str
-            10, // Tree
-            10, // SmallCons
-        ]);
+        // When large objects are disabled, collapse LargeVector (weight 10)
+        // into Vector so the overall distribution of small shapes is unchanged.
+        let weights: &[u32] = if self.enable_large_objects {
+            &[25, 25, 10, 20, 10, 10] // List, Vector, LargeVector, Str, Tree, SmallCons
+        } else {
+            &[25, 35, 0, 20, 10, 10]  // LargeVector weight goes to Vector
+        };
+        let kind = self.rng.weighted_choice(weights);
         match kind {
             0 => {
                 let len = 5 + self.rng.range(80);
@@ -580,9 +614,15 @@ impl Workload {
                 (root, Shape::Vector { len, seed })
             }
             2 => {
-                let len = 100 + self.rng.range(500) as u32;
+                // Large vector: len payload cells where total (1 + len) exceeds
+                // PAGE_SIZE_CELLS. Capped at PAGE_SIZE_CELLS + 50 extra so each
+                // large vector occupies exactly 2 pages, keeping heap pressure
+                // bounded on a 256-page reservation.
+                // Only reachable when enable_large_objects == true.
+                let extra = self.rng.range(51) as u32; // 0..=50 extra cells
+                let len = PAGE_SIZE_CELLS as u32 + extra; // total = PAGE_SIZE_CELLS + 1 + extra
                 let seed = (self.rng.range(1_000_000) as i64) - 500_000;
-                let root = alloc_vector(&mut self.heap, Generation::G0, len, seed);
+                let root = alloc_large_vector(&mut self.heap, Generation::G0, len, seed);
                 (root, Shape::LargeVector { len, seed })
             }
             3 => {
@@ -657,6 +697,17 @@ impl Workload {
         });
         self.redistribute_roots(&roots);
         self.stats.major_cycles += 1;
+    }
+
+    fn full_gc(&mut self) {
+        let mut roots = self.collect_all_roots();
+        self.heap.collect_full(|evac| {
+            for r in roots.iter_mut() {
+                evac.visit(r);
+            }
+        });
+        self.redistribute_roots(&roots);
+        self.stats.full_cycles += 1;
     }
 
     // -- Integrity verification -------------------------------------------
@@ -828,9 +879,10 @@ fn run_stochastic(seed: u64, n_ops: usize, reservation_bytes: usize) {
         w.stats.local_allocations + w.stats.tracked_allocations
     );
     eprintln!(
-        "  gc cycles: {} minor + {} major; {} integrity checks",
+        "  gc cycles: {} minor + {} major + {} full; {} integrity checks",
         w.stats.minor_cycles,
         w.stats.major_cycles,
+        w.stats.full_cycles,
         w.stats.integrity_checks
     );
     eprintln!(
@@ -852,4 +904,131 @@ fn run_stochastic(seed: u64, n_ops: usize, reservation_bytes: usize) {
         w.stats.integrity_checks >= n_ops / verify_every / 2,
         "not enough integrity sweeps fired"
     );
+}
+
+// =========================================================================
+// Workload variants with large objects and collect_full
+// =========================================================================
+
+/// Extended workload step variant. When `enable_full_gc` is true, major-GC
+/// events fire `collect_full` with probability 10% and a regular major with
+/// probability 90%. When false, the behaviour is identical to `run_stochastic`.
+fn run_workload_impl(seed: u64, reservation_bytes: usize, n_ops: usize, enable_full_gc: bool) {
+    let mut w = Workload::with_large_objects(seed, reservation_bytes);
+    let verify_every = 50;
+
+    for _ in 0..n_ops {
+        // Same step as in `run_stochastic`, but replace the major_gc branch
+        // with a split that occasionally calls full_gc instead.
+        w.step += 1;
+        w.stats.ops += 1;
+
+        w.advance_function_returns();
+        w.advance_tracked_deaths();
+
+        let op_kind = w.rng.weighted_choice(&[
+            12, // enter_function
+            18, // alloc_random_local
+            10, // alloc_random_tracked
+            5,  // drop_random_tracked
+            8,  // minor_gc
+            2,  // major_gc (or full_gc when enabled)
+            2,  // verify integrity
+        ]);
+        match op_kind {
+            0 => w.enter_function(),
+            1 => {
+                if w.frames.is_empty() {
+                    w.enter_function();
+                }
+                w.alloc_random_local();
+            }
+            2 => w.alloc_random_tracked(),
+            3 => w.drop_random_tracked(),
+            4 => w.minor_gc(),
+            5 => {
+                if enable_full_gc && w.rng.percent(10) {
+                    w.full_gc();
+                } else {
+                    w.major_gc();
+                }
+            }
+            6 => {
+                w.verify_all_tracked()
+                    .expect("integrity check failed");
+                w.stats.integrity_checks += 1;
+            }
+            _ => unreachable!(),
+        }
+
+        if w.stats.ops % verify_every == 0 {
+            if let Err(msg) = w.verify_all_tracked() {
+                panic!(
+                    "integrity failure at step={}, seed={}: {}\nstats={:?}",
+                    w.step, seed, msg, w.stats
+                );
+            }
+        }
+    }
+
+    if let Err(msg) = w.verify_all_tracked() {
+        panic!(
+            "final integrity failure at step={}, seed={}: {}\nstats={:?}",
+            w.step, seed, msg, w.stats
+        );
+    }
+
+    // Drain everything.
+    w.frames.clear();
+    w.tracked.clear();
+    w.major_gc();
+    assert_eq!(
+        w.heap.count_pages_in_gen(Generation::G0),
+        0,
+        "G0 non-empty after drain major"
+    );
+    assert_eq!(
+        w.heap.count_pages_in_gen(Generation::G1),
+        0,
+        "G1 non-empty after drain major"
+    );
+    let _ = w.heap.evacuate_from_word_roots(Generation::Tenured, Generation::Tenured, &mut []);
+
+    eprintln!("seed={seed}, n_ops={n_ops}, enable_full_gc={enable_full_gc}, stats={:?}", w.stats);
+    eprintln!(
+        "  gc cycles: {} minor + {} major + {} full; {} integrity checks",
+        w.stats.minor_cycles, w.stats.major_cycles, w.stats.full_cycles, w.stats.integrity_checks
+    );
+
+    assert!(
+        w.stats.local_allocations + w.stats.tracked_allocations > n_ops / 10,
+        "workload didn't allocate much"
+    );
+    assert!(w.stats.minor_cycles > 5, "workload didn't trigger enough GCs");
+}
+
+/// Run the full stochastic workload including large objects and minor/major GC.
+fn run_workload(seed: u64, reservation_bytes: usize, n_ops: usize) {
+    run_workload_impl(seed, reservation_bytes, n_ops, false);
+}
+
+/// Run the stochastic workload with `collect_full` enabled ~10% of the time
+/// instead of a regular major cycle.
+fn run_workload_with_full_gc(seed: u64, reservation_bytes: usize, n_ops: usize) {
+    run_workload_impl(seed, reservation_bytes, n_ops, true);
+}
+
+#[test]
+fn stochastic_with_large_objects_seed_7() {
+    // Long workload including large object allocation, minor/major/full GC.
+    // All tracked structures must verify correctly at every integrity check.
+    // 256 pages (16 MB) to accommodate concurrent large-object tracked roots.
+    run_workload(7, 256 * 64 * 1024, 5_000);
+}
+
+#[test]
+fn stochastic_collect_full_session_seed_99() {
+    // Session-style workload: periodic collect_full to simulate REPL.
+    // Tenured must never grow unboundedly.
+    run_workload_with_full_gc(99, 128 * 64 * 1024, 3_000);
 }

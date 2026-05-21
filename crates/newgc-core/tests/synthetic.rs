@@ -23,7 +23,8 @@
 
 use newgc_core::page_heap::evac::EvacResult;
 use newgc_core::{
-    Generation, HeapHeader, HeapType, LispLayout, PageHeap, PAYLOAD_MASK, Tag, Word,
+    FullCollectResult, Generation, HeapHeader, HeapType, LispLayout, PAGE_SIZE_CELLS,
+    PageHeap, PAYLOAD_MASK, Tag, Word,
 };
 
 /// Concrete page-heap type used throughout these synthetic tests.
@@ -790,6 +791,343 @@ fn collect_minor_promotes_after_threshold() {
     // Data still walks.
     let elems = unsafe { list_to_vec(roots[0]) };
     assert_eq!(elems.len(), 50);
+}
+
+// -- collect_full correctness -----------------------------------------------
+
+/// Allocate a large vector with `n_payload` payload cells using
+/// `try_alloc_large`. The total cell count (1 + n_payload) must exceed
+/// PAGE_SIZE_CELLS. Each payload slot is set to `fixnum(seed + i)`.
+/// Returns a Word-tagged pointer (Tag::Vector) to the object header cell.
+fn alloc_large_vec(
+    h: &mut TestHeap,
+    g: Generation,
+    n_payload: usize,
+    seed: i64,
+) -> Word {
+    let total = 1 + n_payload;
+    debug_assert!(
+        total > PAGE_SIZE_CELLS,
+        "alloc_large_vec: total={total} is not > PAGE_SIZE_CELLS={PAGE_SIZE_CELLS}; use vector() instead"
+    );
+    let p = h
+        .try_alloc_large(total, g)
+        .expect("large vector alloc");
+    unsafe {
+        (p.as_ptr() as *mut u64).write(
+            HeapHeader::new(HeapType::Vector, n_payload as u32).raw(),
+        );
+        for i in 0..n_payload {
+            p.as_ptr()
+                .add(1 + i)
+                .write(Word::fixnum(seed.wrapping_add(i as i64)).raw());
+        }
+    }
+    Word::from_ptr(p.as_ptr() as *const u8, Tag::Vector)
+}
+
+/// Verify every payload slot of a large vector created by `alloc_large_vec`.
+unsafe fn check_large_vec_payload(w: Word, n_payload: usize, seed: i64) {
+    assert_eq!(w.tag(), Tag::Vector, "large vec must be Vector-tagged");
+    let base = (w.raw() & PAYLOAD_MASK) as *const u64;
+    for i in 0..n_payload {
+        let slot = unsafe { Word::from_raw(*base.add(1 + i)) };
+        let expected = seed.wrapping_add(i as i64);
+        assert_eq!(
+            slot.as_fixnum(),
+            Some(expected),
+            "large_vec slot {i}: expected {expected}, got {:?}",
+            slot.as_fixnum()
+        );
+    }
+}
+
+/// Promote a word through G0 → G1 → Tenured by running the exact number
+/// of minor cycles required to cross both promotion thresholds.
+fn promote_to_tenured(h: &mut TestHeap, root: &mut Word) {
+    use newgc_core::{G0_PROMOTION_THRESHOLD, G1_PROMOTION_THRESHOLD};
+    let total = G0_PROMOTION_THRESHOLD * G1_PROMOTION_THRESHOLD;
+    for _ in 0..total {
+        h.collect_minor(|evac| evac.visit(root));
+    }
+}
+
+#[test]
+fn collect_full_cross_generation_chain_survives() {
+    // A → B → C chain where A is in G0, B promoted to G1, C to Tenured.
+    // collect_full with A as the only root must keep all three alive.
+    let mut h = medium_heap();
+
+    // Allocate C and promote to Tenured.
+    let c = cons(&mut h, Generation::G0, Word::fixnum(300), Word::NIL);
+    let mut c_root = c;
+    promote_to_tenured(&mut h, &mut c_root);
+    assert_eq!(
+        h.page_of((c_root.raw() & PAYLOAD_MASK) as *const u8)
+            .map(|pg| h.desc(pg).generation),
+        Some(Generation::Tenured),
+        "C must be in Tenured"
+    );
+
+    // Allocate B and promote to G1 (one threshold cycle).
+    let b = cons(&mut h, Generation::G0, Word::fixnum(200), c_root);
+    let mut b_root = b;
+    use newgc_core::G0_PROMOTION_THRESHOLD;
+    for _ in 0..G0_PROMOTION_THRESHOLD {
+        h.collect_minor(|evac| {
+            evac.visit(&mut b_root);
+            evac.visit(&mut c_root);
+        });
+    }
+    assert_eq!(
+        h.page_of((b_root.raw() & PAYLOAD_MASK) as *const u8)
+            .map(|pg| h.desc(pg).generation),
+        Some(Generation::G1),
+        "B must be in G1"
+    );
+
+    // Allocate A in G0 pointing at B.
+    let a = cons(&mut h, Generation::G0, Word::fixnum(100), b_root);
+    let mut a_root = a;
+
+    // collect_full: only A is the explicit root.
+    let _result: FullCollectResult = h.collect_full(|evac| evac.visit(&mut a_root));
+
+    // Walk A → B → C and verify all three fixnums.
+    assert_eq!(a_root.tag(), Tag::Cons);
+    let a_ptr = (a_root.raw() & PAYLOAD_MASK) as *const u64;
+    let a_car = unsafe { Word::from_raw(*a_ptr) };
+    let b_word = unsafe { Word::from_raw(*a_ptr.add(1)) };
+    assert_eq!(a_car.as_fixnum(), Some(100), "A car intact");
+
+    assert_eq!(b_word.tag(), Tag::Cons);
+    let b_ptr = (b_word.raw() & PAYLOAD_MASK) as *const u64;
+    let b_car = unsafe { Word::from_raw(*b_ptr) };
+    let c_word = unsafe { Word::from_raw(*b_ptr.add(1)) };
+    assert_eq!(b_car.as_fixnum(), Some(200), "B car intact");
+
+    assert_eq!(c_word.tag(), Tag::Cons);
+    let c_ptr = (c_word.raw() & PAYLOAD_MASK) as *const u64;
+    let c_car = unsafe { Word::from_raw(*c_ptr) };
+    assert_eq!(c_car.as_fixnum(), Some(300), "C car intact");
+}
+
+#[test]
+fn collect_full_progressive_tenured_reclaim() {
+    // 5 batches of objects each promoted to Tenured, then dropped.
+    // collect_full after each batch must reclaim that batch's pages.
+    // At the end Tenured must be empty (0 pages).
+    let mut h = medium_heap();
+
+    for batch in 0..5i64 {
+        // Allocate 20 cons cells and promote them to Tenured.
+        let mut roots: Vec<Word> = (0..20)
+            .map(|i| cons(&mut h, Generation::G0, Word::fixnum(batch * 100 + i), Word::NIL))
+            .collect();
+        promote_to_tenured_slice(&mut h, &mut roots);
+        let tenured_before = h.count_pages_in_gen(Generation::Tenured);
+        assert!(tenured_before > 0, "batch {batch}: Tenured should have pages");
+
+        // Drop all roots from this batch and call collect_full with no roots.
+        let _result: FullCollectResult = h.collect_full(|_| {});
+        assert_eq!(
+            h.count_pages_in_gen(Generation::Tenured),
+            0,
+            "batch {batch}: collect_full must reclaim all Tenured pages"
+        );
+    }
+}
+
+/// Promote a Vec<Word> to Tenured via the minor-cycle ladder.
+fn promote_to_tenured_slice(h: &mut TestHeap, roots: &mut Vec<Word>) {
+    use newgc_core::{G0_PROMOTION_THRESHOLD, G1_PROMOTION_THRESHOLD};
+    let total = G0_PROMOTION_THRESHOLD * G1_PROMOTION_THRESHOLD;
+    for _ in 0..total {
+        h.collect_minor(|evac| {
+            for r in roots.iter_mut() {
+                evac.visit(r);
+            }
+        });
+    }
+}
+
+#[test]
+fn collect_full_linked_vector_chain_intact() {
+    // 30-vector singly-linked chain spanning G0, G1, and Tenured.
+    // Each vector has 2 payload slots: [payload_fixnum, next_vector].
+    // After collect_full the chain must be intact end-to-end.
+    let mut h = medium_heap();
+    const N: usize = 30;
+    const SEED_BASE: i64 = 77_000;
+
+    // Build in G0 first, then promote the rear portion selectively.
+    // Simplest approach: build all in G0, then partial-promote.
+    let mut chain_head = Word::NIL;
+    let mut nodes: Vec<Word> = Vec::with_capacity(N);
+    for i in (0..N).rev() {
+        let node = vector(&mut h, Generation::G0, 2, Word::NIL);
+        unsafe {
+            set_vector_slot(node, 1, Word::fixnum(SEED_BASE + i as i64));
+            set_vector_slot(node, 2, chain_head);
+        }
+        chain_head = node;
+        nodes.push(node);
+    }
+
+    let mut root = chain_head;
+
+    // Run enough minor cycles to advance the chain to mixed generations.
+    use newgc_core::G0_PROMOTION_THRESHOLD;
+    for _ in 0..G0_PROMOTION_THRESHOLD {
+        h.collect_minor(|evac| evac.visit(&mut root));
+    }
+
+    // collect_full.
+    let _: FullCollectResult = h.collect_full(|evac| evac.visit(&mut root));
+
+    // Walk the chain and check all 30 payload values.
+    let mut cur = root;
+    for i in 0..N {
+        assert_eq!(cur.tag(), Tag::Vector, "node {i} not Vector-tagged after collect_full");
+        let payload = unsafe { vector_slot(cur, 1) };
+        assert_eq!(
+            payload.as_fixnum(),
+            Some(SEED_BASE + i as i64),
+            "node {i} payload corrupt"
+        );
+        cur = unsafe { vector_slot(cur, 2) };
+    }
+    assert!(cur.is_nil(), "chain tail must be NIL");
+}
+
+#[test]
+fn collect_full_large_object_reclaim_and_survive() {
+    // Allocate a large object (PAGE_SIZE_CELLS + 100 cells total) in G0,
+    // promote to Tenured via minor cycles, then:
+    //   (a) collect_full WITH root: object must survive.
+    //   (b) collect_full WITHOUT root: object must be reclaimed.
+    let n_payload = PAGE_SIZE_CELLS + 99; // total = PAGE_SIZE_CELLS + 100
+    const SEED: i64 = 42_000;
+    let mut h = TestHeap::with_reservation(64 * 64 * 1024);
+
+    let large = alloc_large_vec(&mut h, Generation::G0, n_payload, SEED);
+    let mut root = large;
+    promote_to_tenured(&mut h, &mut root);
+
+    let tenured_before = h.count_pages_in_gen(Generation::Tenured);
+    assert!(tenured_before > 0, "large object must occupy Tenured pages");
+
+    // (a) Survive with root.
+    let _: FullCollectResult = h.collect_full(|evac| evac.visit(&mut root));
+    unsafe { check_large_vec_payload(root, n_payload, SEED) };
+    assert!(
+        h.count_pages_in_gen(Generation::Tenured) > 0,
+        "large object still alive after collect_full with root"
+    );
+
+    // (b) Reclaim without root.
+    let result: FullCollectResult = h.collect_full(|_| {});
+    assert!(
+        result.tenured_evac.pages_freed > 0,
+        "collect_full without root must reclaim large object pages"
+    );
+    assert_eq!(
+        h.count_pages_in_gen(Generation::Tenured),
+        0,
+        "Tenured must be empty after dropping large object root"
+    );
+}
+
+// -- Large object correctness -----------------------------------------------
+
+#[test]
+fn large_objects_multiple_sizes_stable_addresses() {
+    // Allocate three large objects of different sizes:
+    //   - 1.5 pages: PAGE_SIZE_CELLS * 3 / 2 cells
+    //   - 2 pages:   PAGE_SIZE_CELLS * 2 cells
+    //   - 3 pages:   PAGE_SIZE_CELLS * 3 cells
+    // Root all three through 5 minor GC cycles. Verify all addresses
+    // are stable and all payload fixnums are intact.
+    let mut h = TestHeap::with_reservation(128 * 64 * 1024);
+
+    let n1 = PAGE_SIZE_CELLS * 3 / 2; // 1.5 pages, payload = n1 - 1
+    let n2 = PAGE_SIZE_CELLS * 2;     // 2 pages, payload = n2 - 1
+    let n3 = PAGE_SIZE_CELLS * 3;     // 3 pages, payload = n3 - 1
+
+    let seed1: i64 = 1_000;
+    let seed2: i64 = 2_000;
+    let seed3: i64 = 3_000;
+
+    let lv1 = alloc_large_vec(&mut h, Generation::G0, n1 - 1, seed1);
+    let lv2 = alloc_large_vec(&mut h, Generation::G0, n2 - 1, seed2);
+    let lv3 = alloc_large_vec(&mut h, Generation::G0, n3 - 1, seed3);
+
+    let addr1 = lv1.raw() & PAYLOAD_MASK;
+    let addr2 = lv2.raw() & PAYLOAD_MASK;
+    let addr3 = lv3.raw() & PAYLOAD_MASK;
+
+    let mut roots = [lv1, lv2, lv3];
+
+    for cycle in 0..5 {
+        h.collect_minor(|evac| {
+            for r in roots.iter_mut() {
+                evac.visit(r);
+            }
+        });
+        // Large objects are pinned — addresses must never change.
+        assert_eq!(roots[0].raw() & PAYLOAD_MASK, addr1, "cycle {cycle}: lv1 address changed");
+        assert_eq!(roots[1].raw() & PAYLOAD_MASK, addr2, "cycle {cycle}: lv2 address changed");
+        assert_eq!(roots[2].raw() & PAYLOAD_MASK, addr3, "cycle {cycle}: lv3 address changed");
+    }
+
+    // All payloads intact.
+    unsafe {
+        check_large_vec_payload(roots[0], n1 - 1, seed1);
+        check_large_vec_payload(roots[1], n2 - 1, seed2);
+        check_large_vec_payload(roots[2], n3 - 1, seed3);
+    }
+}
+
+#[test]
+fn large_object_stable_amid_small_churn() {
+    // Allocate a large object and a small cons chain in G0. Root both.
+    // Alternately drop and re-allocate small objects for 10 minor cycles.
+    // The large object must survive every cycle at its original address.
+    let mut h = TestHeap::with_reservation(64 * 64 * 1024);
+
+    let n_payload = PAGE_SIZE_CELLS + 49; // just over one page
+    const SEED: i64 = 55_000;
+
+    let large = alloc_large_vec(&mut h, Generation::G0, n_payload, SEED);
+    let original_addr = large.raw() & PAYLOAD_MASK;
+    let mut large_root = large;
+
+    let mut small_root = list(&mut h, Generation::G0, 20);
+
+    for cycle in 0..10 {
+        h.collect_minor(|evac| {
+            evac.visit(&mut large_root);
+            if cycle % 2 == 0 {
+                evac.visit(&mut small_root);
+            }
+            // On odd cycles, small_root is dropped (not visited).
+        });
+
+        // Large object address must never change (it is pinned).
+        assert_eq!(
+            large_root.raw() & PAYLOAD_MASK,
+            original_addr,
+            "cycle {cycle}: large object moved"
+        );
+
+        // Re-allocate small objects on cycles where they were dropped.
+        if cycle % 2 == 1 {
+            small_root = list(&mut h, Generation::G0, 20);
+        }
+
+        // Payload still intact.
+        unsafe { check_large_vec_payload(large_root, n_payload, SEED) };
+    }
 }
 
 // -- Final smoke ------------------------------------------------------------

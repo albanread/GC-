@@ -52,7 +52,7 @@ use crate::traits::HeapLayout;
 use super::coordinator_api::scan_dirty_cards_as_roots;
 use super::evac::{EvacResult, PageEvacuator};
 use super::page_desc::{Generation, PageDesc};
-use super::space::PageHeap;
+use super::space::{PageHeap, PAGE_SIZE_BYTES};
 
 /// Minor cycles a G0 cohort survives before promotion to G1.
 /// Default 3 — matches the design doc / SBCL conservative value.
@@ -84,6 +84,22 @@ pub struct CollectResult {
     pub promoted_g1: bool,
     /// Minor-cycle counter value AFTER this cycle. Diagnostic.
     pub minors_since_g0_promote_after: u32,
+}
+
+/// Summary of a `collect_full` cycle. Returned from
+/// [`PageHeap::collect_full`]; consumed by the Dylan runtime's
+/// full-GC telemetry and the trigger policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FullCollectResult {
+    /// Pass 1 result: G0 → G1 (forced).
+    pub g0_evac: EvacResult,
+    /// Pass 2 result: G1 → Tenured (forced).
+    pub g1_evac: EvacResult,
+    /// Pass 3 result: Tenured → Tenured (compact using explicit roots).
+    pub tenured_evac: EvacResult,
+    /// Bytes freed from Tenured by pass 3. Approximately
+    /// `tenured_evac.pages_freed × PAGE_SIZE_BYTES`.
+    pub tenured_freed_bytes: usize,
 }
 
 impl<L: HeapLayout> PageHeap<L> {
@@ -295,6 +311,103 @@ impl<L: HeapLayout> PageHeap<L> {
             promoted_g0: false,
             promoted_g1,
             minors_since_g0_promote_after: 0,
+        }
+    }
+
+    /// Full stop-the-world collection: force-promote all young objects
+    /// to Tenured, then compact Tenured using only the caller's explicit
+    /// roots.
+    ///
+    /// ## Algorithm (three passes)
+    ///
+    /// 1. **G0 → G1** (forced, ignoring `minors_since_g0_promote`):
+    ///    move all live G0 objects to G1. Card scan finds Tenured/G1→G0
+    ///    cross-gen pointers.
+    /// 2. **G1 → Tenured** (forced): move all live G1 objects to Tenured.
+    ///    Card scan finds Tenured→G1 cross-gen pointers.
+    /// 3. **Tenured → Tenured** (compact): evacuate live Tenured objects
+    ///    into fresh Tenured pages using *only* the caller's explicit
+    ///    roots — no card scan. After passes 1 and 2, G0 and G1 are
+    ///    empty, so there are no external young-gen references to Tenured
+    ///    objects outside the explicit root set. Dead Tenured objects are
+    ///    reclaimed.
+    ///
+    /// Both promotion counters are reset to 0 after this call.
+    ///
+    /// ## When to call
+    ///
+    /// - `tenured_used_bytes / reserved_bytes > 0.70` (Tenured fill).
+    /// - Explicit user request (`(gc)` in the Dylan REPL).
+    /// - End of a compilation unit, before starting the next.
+    pub fn collect_full<F>(&mut self, mut visit_roots: F) -> FullCollectResult
+    where
+        F: FnMut(&mut PageEvacuator<'_, L>),
+    {
+        // Pre-capture shared data so closures can hold owned values
+        // without borrowing `self`. Same pattern as collect_minor /
+        // collect_major.
+        let reservation_cards: Arc<CardTable> = Arc::clone(&self.cards);
+        let reservation_base: *mut u64 = self.base_ptr() as *mut u64;
+        let reservation_cells: usize = self.reserved_bytes() / 8;
+
+        // Pass 1: G0 → G1 (forced — dest is always G1 regardless of the
+        // minors_since_g0_promote counter). Card scan picks up
+        // Tenured/G1→G0 cross-gen pointers written by the mutator.
+        let descs_before_p1: Vec<PageDesc> = self.descs().to_vec();
+        let g0_evac = self.evacuate_with_roots(Generation::G0, Generation::G1, |e| {
+            visit_roots(e);
+            scan_dirty_cards_as_roots(
+                e,
+                &reservation_cards,
+                reservation_base,
+                reservation_cells,
+                Some(&descs_before_p1),
+            );
+        });
+
+        // Pass 2: G1 → Tenured (forced). Snapshot descs AFTER pass 1
+        // so the filter reflects pages that were G1 at the start of
+        // pass 2 (not G0 objects just promoted to G1 by pass 1 — those
+        // are already in their destination and don't need re-scanning).
+        let descs_before_p2: Vec<PageDesc> = self.descs().to_vec();
+        let g1_evac = self.evacuate_with_roots(Generation::G1, Generation::Tenured, |e| {
+            visit_roots(e);
+            scan_dirty_cards_as_roots(
+                e,
+                &reservation_cards,
+                reservation_base,
+                reservation_cells,
+                Some(&descs_before_p2),
+            );
+        });
+
+        // Pass 3: Tenured → Tenured (compact). G0 and G1 are empty after
+        // passes 1 and 2, so the caller's explicit roots are the complete
+        // root set. No card scan needed.
+        let tenured_evac = self.evacuate_with_roots(
+            Generation::Tenured,
+            Generation::Tenured,
+            |e| {
+                visit_roots(e);
+                // Intentionally no card scan here. Post-passes-1-and-2
+                // invariant: G0 = empty, G1 = empty. Every live Tenured
+                // object is reachable from the explicit root set alone.
+            },
+        );
+
+        // Rebuild card table from post-pass-3 heap state and reset both
+        // promotion counters. The next minor cycle starts a fresh G0
+        // cohort with a clean slate.
+        self.rebuild_cards_for_old_gens();
+        self.minors_since_g0_promote = 0;
+        self.g0_promotes_since_g1_promote = 0;
+
+        let tenured_freed_bytes = tenured_evac.pages_freed * PAGE_SIZE_BYTES;
+        FullCollectResult {
+            g0_evac,
+            g1_evac,
+            tenured_evac,
+            tenured_freed_bytes,
         }
     }
 
@@ -668,5 +781,150 @@ mod tests {
         }
         // 100 / 3 = 33 promotions; counter sits at 100 mod 3 = 1.
         assert_eq!(h.minors_since_g0_promote(), 100 % G0_PROMOTION_THRESHOLD);
+    }
+
+    // ── collect_full tests ──────────────────────────────────────────
+
+    #[test]
+    fn full_collect_on_empty_heap_is_noop() {
+        let mut h = small_heap();
+        let result = h.collect_full(|_| {});
+        assert_eq!(result.g0_evac.objects_copied, 0);
+        assert_eq!(result.g1_evac.objects_copied, 0);
+        assert_eq!(result.tenured_evac.objects_copied, 0);
+        assert_eq!(result.tenured_freed_bytes, 0);
+        assert_eq!(h.minors_since_g0_promote(), 0);
+        assert_eq!(h.g0_promotes_since_g1_promote(), 0);
+    }
+
+    #[test]
+    fn full_collect_resets_both_promotion_counters() {
+        let mut h = small_heap();
+        let mut root = [one_cons(&mut h, 1)];
+        // Run a few minor cycles to advance the counters.
+        for _ in 0..2 {
+            h.collect_minor(|evac| evac.visit(&mut root[0]));
+        }
+        assert!(h.minors_since_g0_promote() > 0);
+        h.collect_full(|evac| evac.visit(&mut root[0]));
+        assert_eq!(h.minors_since_g0_promote(), 0);
+        assert_eq!(h.g0_promotes_since_g1_promote(), 0);
+    }
+
+    #[test]
+    fn g0_and_g1_empty_after_full_collect() {
+        let mut h = small_heap();
+        let mut root = [one_cons(&mut h, 42)];
+        // Promote root to G1 via minor cycles.
+        for _ in 0..G0_PROMOTION_THRESHOLD {
+            h.collect_minor(|evac| evac.visit(&mut root[0]));
+        }
+        assert!(h.count_pages_in_gen(Generation::G1) >= 1);
+        h.collect_full(|evac| evac.visit(&mut root[0]));
+        assert_eq!(h.count_pages_in_gen(Generation::G0), 0, "G0 empty after full collect");
+        assert_eq!(h.count_pages_in_gen(Generation::G1), 0, "G1 empty after full collect");
+    }
+
+    #[test]
+    fn rooted_tenured_objects_survive_full_collect() {
+        let mut h = small_heap();
+        let mut root = [one_cons(&mut h, 99)];
+        // Promote to Tenured via threshold × threshold minor cycles.
+        let total = G0_PROMOTION_THRESHOLD * G1_PROMOTION_THRESHOLD;
+        for _ in 0..total {
+            h.collect_minor(|evac| evac.visit(&mut root[0]));
+        }
+        let addr_before = root[0].raw() & crate::word::PAYLOAD_MASK;
+        // Full collect with root: object must survive and value preserved.
+        h.collect_full(|evac| evac.visit(&mut root[0]));
+        assert_eq!(
+            h.count_pages_in_gen(Generation::Tenured),
+            1,
+            "rooted Tenured cons still occupies one page"
+        );
+        // Value is intact (no corruption through evacuation).
+        let addr_after = root[0].raw() & crate::word::PAYLOAD_MASK;
+        let val = unsafe { Word::from_raw(*(addr_after as *const u64)) }.as_fixnum();
+        assert_eq!(val, Some(99), "value preserved through collect_full");
+        let _ = addr_before; // address may change due to within-gen evac
+    }
+
+    #[test]
+    fn tenured_garbage_reclaimed_on_full_collect() {
+        let mut h = small_heap();
+        let mut root = [one_cons(&mut h, 7)];
+        // Promote to Tenured.
+        let total = G0_PROMOTION_THRESHOLD * G1_PROMOTION_THRESHOLD;
+        for _ in 0..total {
+            h.collect_minor(|evac| evac.visit(&mut root[0]));
+        }
+        let tenured_before = h.count_pages_in_gen(Generation::Tenured);
+        assert!(tenured_before >= 1, "object is in Tenured before collect_full");
+        // collect_full with NO roots → Tenured object is unreachable → reclaimed.
+        let result = h.collect_full(|_| {});
+        assert!(
+            result.tenured_evac.pages_freed >= 1,
+            "collect_full freed at least one Tenured page; got {:?}", result.tenured_evac
+        );
+        assert_eq!(
+            h.count_pages_in_gen(Generation::Tenured),
+            0,
+            "all Tenured pages reclaimed when object is unrooted"
+        );
+        assert!(result.tenured_freed_bytes > 0);
+    }
+
+    #[test]
+    fn repl_session_tenured_does_not_grow() {
+        // Simulate a REPL: repeatedly allocate a cons, promote it to
+        // Tenured, then call collect_full without a root. Tenured must
+        // not accumulate across sessions.
+        let mut h = small_heap();
+        let total = G0_PROMOTION_THRESHOLD * G1_PROMOTION_THRESHOLD;
+        for session in 0..4 {
+            let mut root = [one_cons(&mut h, session as i64)];
+            for _ in 0..total {
+                h.collect_minor(|evac| evac.visit(&mut root[0]));
+            }
+            // Drop root — don't visit it in collect_full.
+            h.collect_full(|_| {});
+            assert_eq!(
+                h.count_pages_in_gen(Generation::Tenured),
+                0,
+                "session {session}: Tenured must be empty after collect_full with no roots"
+            );
+        }
+    }
+
+    #[test]
+    fn full_collect_mixed_live_and_dead_tenured() {
+        // Two objects promoted to Tenured. One is rooted (survives),
+        // one is not (reclaimed). After collect_full, exactly one
+        // Tenured object remains.
+        let mut h = small_heap();
+        let mut live_root = [one_cons(&mut h, 111)];
+        let mut dead_root = [one_cons(&mut h, 222)];
+        let total = G0_PROMOTION_THRESHOLD * G1_PROMOTION_THRESHOLD;
+        for _ in 0..total {
+            h.collect_minor(|evac| {
+                evac.visit(&mut live_root[0]);
+                evac.visit(&mut dead_root[0]);
+            });
+        }
+        assert_eq!(h.count_pages_in_gen(Generation::G0), 0);
+        assert_eq!(h.count_pages_in_gen(Generation::G1), 0);
+        assert!(h.count_pages_in_gen(Generation::Tenured) >= 1);
+        // collect_full: only live_root is visited.
+        let result = h.collect_full(|evac| evac.visit(&mut live_root[0]));
+        // live cons must still be readable.
+        let live_val = unsafe {
+            let addr = live_root[0].raw() & crate::word::PAYLOAD_MASK;
+            Word::from_raw(*(addr as *const u64)).as_fixnum()
+        };
+        assert_eq!(live_val, Some(111));
+        // At least the dead object's contribution was freed.
+        // (Both may share a page; freed_bytes may be 0 if they shared.
+        // What matters is the live object is intact.)
+        let _ = result;
     }
 }

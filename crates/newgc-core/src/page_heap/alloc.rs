@@ -333,6 +333,96 @@ impl<L: HeapLayout> PageHeap<L> {
         Some(unsafe { NonNull::new_unchecked(ptr) })
     }
 
+    /// Allocate a large object of `n_cells` cells in `generation`.
+    /// Large objects span one or more whole 64 KB pages; they are
+    /// never bump-allocated into a shared page. Returns a pointer to
+    /// the first cell (the wrapper-header cell) of the object, or
+    /// `None` if no contiguous run of sufficient free pages is available.
+    ///
+    /// The caller must write a valid `HeapHeader` at cell 0 before the
+    /// object is reachable from any root.
+    ///
+    /// Large objects are treated as pinned by the GC: they never move
+    /// during evacuation. Their generation is flipped in-place on
+    /// promotion.
+    pub fn try_alloc_large(
+        &mut self,
+        n_cells: usize,
+        generation: Generation,
+    ) -> Option<std::ptr::NonNull<u64>> {
+        let n_pages = n_cells.div_ceil(PAGE_SIZE_CELLS);
+        debug_assert!(
+            n_pages >= 1,
+            "try_alloc_large called with n_cells={n_cells}"
+        );
+
+        // Find the first run of n_pages contiguous Free pages.
+        let start_idx = self.find_contiguous_free_pages(n_pages)?;
+
+        // Cells per start-bits word (2 bits per cell).
+        const CELLS_PER_STARTS_WORD: usize = 32;
+        const WORDS_PER_PAGE: usize = PAGE_SIZE_CELLS / CELLS_PER_STARTS_WORD;
+
+        // Commit and stamp all pages in the run.
+        for i in 0..n_pages {
+            let idx = start_idx + i;
+            self.commit_page(idx).ok()?;
+            let mut d = super::page_desc::PageDesc::fresh(generation, super::page_desc::PageKind::Large);
+            d.words_used = PAGE_SIZE_CELLS as u16;
+            if i == 0 {
+                // Head page: record the run length.
+                d.n_span = n_pages as u16;
+            }
+            // Continuation pages: n_span stays 0 (set by fresh for Large).
+            *self.desc_mut(idx) = d;
+            // Zero the page cells to clear any stale forwarding markers
+            // from a prior tenant (same as acquire_free_page bug-fix #4).
+            unsafe {
+                let page_base = self.page_ptr(idx) as *mut u64;
+                std::ptr::write_bytes(page_base, 0, PAGE_SIZE_CELLS);
+            }
+            // Clear stale start bits for this page.
+            let first_word = idx * WORDS_PER_PAGE;
+            let bits = self.start_bits_slice();
+            for w in first_word..first_word + WORDS_PER_PAGE {
+                bits[w].store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        // Set one boxed-header start bit at cell 0 of the head page.
+        let head_cell = start_idx * PAGE_SIZE_CELLS;
+        set_start_bit_at(self.start_bits_slice(), head_cell);
+
+        // Charge allocation bytes to the GC trigger counter.
+        self.bytes_alloc_since_gc =
+            self.bytes_alloc_since_gc.saturating_add(n_cells * 8);
+
+        let ptr = self.page_ptr(start_idx) as *mut u64;
+        std::ptr::NonNull::new(ptr)
+    }
+
+    /// Find the index of the first run of `n` contiguous Free pages,
+    /// scanning from page 0. Returns `None` if no such run exists.
+    fn find_contiguous_free_pages(&self, n: usize) -> Option<usize> {
+        let total = self.page_count();
+        let mut run_start = 0;
+        let mut run_len = 0;
+        for i in 0..total {
+            if self.descs[i].generation == Generation::Free {
+                if run_len == 0 {
+                    run_start = i;
+                }
+                run_len += 1;
+                if run_len >= n {
+                    return Some(run_start);
+                }
+            } else {
+                run_len = 0;
+            }
+        }
+        None
+    }
+
     /// Global cell index (offset from `base_ptr` in cells) for
     /// the cell at `(page_idx, offset_within_page)`.
     pub fn global_cell_index(&self, page_idx: usize, cell_offset: usize) -> usize {

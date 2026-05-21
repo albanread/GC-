@@ -10,7 +10,7 @@
 //! ## Design
 //!
 //! A `PageHeap` owns a fixed-size virtual reservation (default
-//! 1 GB) divided into 64 KB pages. Each page is in one of two
+//! 2 GB) divided into 64 KB pages. Each page is in one of two
 //! states:
 //!
 //!   - **Reserved-but-uncommitted** — address range valid but no
@@ -71,11 +71,11 @@ pub const PAGE_SIZE_BYTES: usize = 64 * 1024;
 /// Size of a page in cells (64-bit words).
 pub const PAGE_SIZE_CELLS: usize = PAGE_SIZE_BYTES / 8;
 
-/// Default reservation size: 1 GB → 16384 pages. Sized for a
-/// long-running session with plenty of headroom. Costs ~16 KB of
+/// Default reservation size: 2 GB → 32768 pages. Sized for a
+/// long-running session with plenty of headroom. Costs ~32 KB of
 /// commit-bitmap storage and one entry in the OS VAD tree; no
 /// physical RAM until pages are committed.
-pub const DEFAULT_RESERVATION_BYTES: usize = 1024 * 1024 * 1024;
+pub const DEFAULT_RESERVATION_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 /// The page-heap reservation.
 ///
@@ -133,7 +133,7 @@ pub struct PageHeap<L: HeapLayout> {
     /// cell, packed into `AtomicU64` words. Pair `01` = boxed
     /// header start, `11` = cons start, `00` = not a start.
     ///
-    /// 32 MB for the 1 GB default reservation (3% overhead).
+    /// 64 MB for the 2 GB default reservation (3% overhead).
     /// Mutators can cache an `Arc<[AtomicU64]>` handle (same as
     /// `StartBits` in `heap.rs`) and use the same atomic-OR fast
     /// path for marking starts.
@@ -143,7 +143,7 @@ pub struct PageHeap<L: HeapLayout> {
     /// word `c / 64` is set when cell `c` is the start of a
     /// reachable object on the most recent mark pass.
     ///
-    /// 16 MB for the 1 GB default reservation. Plain `Box<[u64]>`,
+    /// 32 MB for the 2 GB default reservation. Plain `Box<[u64]>`,
     /// not atomic, because mark is STW — exclusive `&mut self` on
     /// `PageHeap` keeps races impossible. Sub-phase 5 of the
     /// design doc; consumed by sub-phase 7 evacuation.
@@ -191,7 +191,7 @@ pub struct PageHeap<L: HeapLayout> {
     /// Soft card-marking table covering the WHOLE reservation
     /// (page-heap doesn't split into young/old address ranges the
     /// way the semispace does). One byte per `CARD_SIZE_BYTES`
-    /// = 512 bytes; ~2 MB for the 1 GB default reservation.
+    /// = 512 bytes; ~4 MB for the 2 GB default reservation.
     ///
     /// Sub-phase 9: mutator-side stores into older-than-G0 objects
     /// mark cards via `GcCoordinator::mark_card`. Minor GC scans
@@ -354,7 +354,7 @@ impl<L: HeapLayout> PageHeap<L> {
         let n_bitmap_words = n_pages.div_ceil(64);
         let committed_bits = (0..n_bitmap_words).map(|_| AtomicU64::new(0)).collect();
         // Per-page metadata table — every page starts as Free.
-        // ~12 bytes × n_pages of allocation (192 KB for the 1 GB
+        // ~12 bytes × n_pages of allocation (384 KB for the 2 GB
         // default reservation; tiny compared to what it describes).
         let descs = vec![PageDesc::FREE; n_pages];
         // Open allocation regions, all empty (no current page).
@@ -376,8 +376,8 @@ impl<L: HeapLayout> PageHeap<L> {
         ];
         // Global start-bit bitmap. 2 bits per cell, 32 cells per
         // u64 word, n_pages × PAGE_SIZE_CELLS cells total. For the
-        // 1 GB default reservation: 16384 × 8192 / 32 = 4M words
-        // = 32 MB.
+        // 2 GB default reservation: 32768 × 8192 / 32 = 8M words
+        // = 64 MB.
         let total_cells = n_pages * PAGE_SIZE_CELLS;
         let n_start_words = total_cells.div_ceil(32);
         let start_vec: Vec<AtomicU64> =
@@ -1169,7 +1169,7 @@ impl<L: HeapLayout> PageHeap<L> {
     /// a time without losing prior survivors.
     pub fn clear_mark_bits_in_gen(&mut self, target: Generation) {
         // Collect page indices first to avoid borrowing `self`
-        // mutably twice. Fast — n_pages is at most 16384.
+        // mutably twice. Fast — n_pages is at most 32768.
         let pages: Vec<usize> = self
             .descs
             .iter()
@@ -1340,7 +1340,7 @@ mod tests {
     use super::*;
 
     /// Cap the reservation size in tests so we don't ask the OS for
-    /// 1 GB just to verify the bookkeeping.
+    /// 2 GB just to verify the bookkeeping.
     fn small_heap() -> PageHeap<crate::lisp_layout::LispLayout> {
         // 1 MB = 16 pages. Plenty to exercise page indexing without
         // wasting VAD space across thousands of test runs.

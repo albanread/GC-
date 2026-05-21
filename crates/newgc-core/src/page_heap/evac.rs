@@ -336,6 +336,39 @@ impl<'a, L: HeapLayout> PageEvacuator<'a, L> {
             return;
         }
         let kind = self.heap.desc(page_idx).kind;
+
+        // Large objects are never evacuated — they stay at their original
+        // address. Pin all pages in the run so phase3_reclaim flips their
+        // generation in-place. Record the head cell in pinned_cells so
+        // phase2_rewrite can walk the large object's payload and fix up
+        // any pointers to evacuated small objects.
+        if kind == PageKind::Large {
+            // Find the head page (a slot should always point to a head cell,
+            // but scan backwards defensively for a cont page).
+            let head_page_idx = if self.heap.desc(page_idx).is_large_head() {
+                page_idx
+            } else {
+                let mut h = page_idx;
+                while h > 0 && self.heap.desc(h).is_large_cont() {
+                    h -= 1;
+                }
+                h
+            };
+            let n_span = self.heap.desc(head_page_idx).n_span as usize;
+            // Pin every page in the run so phase3_reclaim flips them all.
+            for i in 0..n_span {
+                let pidx = head_page_idx + i;
+                self.heap.desc_mut(pidx).set_pin(0);
+            }
+            // Record only the head cell in pinned_cells.
+            // rewrite_pinned_object will walk the header to find the full
+            // payload extent (which spans all pages in the run).
+            let head_cell = head_page_idx * PAGE_SIZE_CELLS;
+            self.heap.pinned_cells.insert(head_cell);
+            // Leave the slot unchanged — the large object didn't move.
+            return;
+        }
+
         if !matches!(kind, PageKind::Cons | PageKind::Boxed) {
             return;
         }
@@ -648,6 +681,11 @@ impl<L: HeapLayout> PageHeap<L> {
             // flipped during an earlier chunk; filter by current
             // generation each iteration.
             if self.desc(page_idx).generation != from_gen {
+                continue;
+            }
+            // Large pages are never evacuated (their objects stay in place
+            // and are handled by phase3_reclaim). Skip them here.
+            if self.desc(page_idx).kind == PageKind::Large {
                 continue;
             }
             let first_cell = page_idx * PAGE_SIZE_CELLS;
@@ -1013,6 +1051,50 @@ impl<L: HeapLayout> PageHeap<L> {
                 // Pre-released for zero-mark — skip here.
                 continue;
             }
+
+            // Large continuation pages are handled when their head page is
+            // processed. Skip them here so we don't double-process.
+            if desc.is_large_cont() {
+                continue;
+            }
+
+            // Large head pages: handle the whole run together.
+            if desc.is_large_head() {
+                let n_span = desc.n_span as usize;
+                if desc.has_pins() {
+                    // Live large object: flip all pages in the run to dest_gen.
+                    for i in 0..n_span {
+                        let pidx = page_idx + i;
+                        {
+                            let d = self.desc_mut(pidx);
+                            d.generation = dest_gen;
+                            d.age = 0;
+                            d.pin_byte = 0;
+                        }
+                        // Continuation pages have no object starts — clear
+                        // their start bits. The head page keeps its single
+                        // object-start bit (set by try_alloc_large).
+                        if i > 0 {
+                            clear_page_start_bits(self.start_bits_slice(), pidx);
+                        }
+                    }
+                    flipped += n_span;
+                } else {
+                    // Dead large object: release all pages in the run.
+                    for i in 0..n_span {
+                        let pidx = page_idx + i;
+                        clear_page_start_bits(self.start_bits_slice(), pidx);
+                        zero_whole_page(self, pidx);
+                        self.desc_mut(pidx).release();
+                        if self.is_committed(pidx) {
+                            let _ = self.decommit_page(pidx);
+                        }
+                    }
+                    released += n_span;
+                }
+                continue;
+            }
+
             if desc.has_pins() {
                 // FLIP. Collect the pinned objects' byte ranges
                 // FIRST (we need to read each boxed header to know
