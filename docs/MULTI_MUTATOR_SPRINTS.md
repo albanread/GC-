@@ -293,7 +293,7 @@ multi-mutator core does not add that pass to the snapshot-roots driver.
 
 ---
 
-## MM-8 — Hardening  *(≈4 days; deps: MM-7)*
+## MM-8 — Hardening  *(≈4 days; deps: MM-7)* — ✅ DONE
 
 **Design:** §10–§11. **Goal:** stress + model-checking + ergonomics.
 
@@ -309,6 +309,39 @@ multi-mutator core does not add that pass to the snapshot-roots driver.
 - Update `THREADING.md` to describe the shipped state.
 
 **Done when:** stress + loom green; docs reflect reality.
+
+**Shipped:**
+- **Stress** (`tests/stress_mt.rs`) — `stress_multi_mutator_alloc_gc_native_pin`:
+  N=6 workers concurrently alloc/churn, hold a rooted set with sentinels,
+  poll, take `enter_native`/`leave_native` excursions, and pin/unpin
+  across collections while a driver runs minor + occasional full cycles;
+  every worker asserts its rooted invariant each iteration. Tunable via
+  `NEWGC_STRESS_ITERS` (modest default keeps the suite fast). Validated at
+  500k iters × 6 workers (3M iterations) in release. Also exercises the
+  alloc/refill/pin-vs-collect heap-lock interaction (no deadlock: a worker
+  holding the heap lock isn't parked, and the driver locks the heap only
+  after all workers park).
+- **Loom** (`tests/loom_safepoint.rs`, `#![cfg(loom)]`, wired via
+  `[target.'cfg(loom)'.dependencies]` so normal builds never resolve it) —
+  three models of the handshake orderings, each a standalone replica of a
+  rule in `mutator.rs`: MM-5 root publication visibility, MM-4 Fix B
+  torn-read prevention (verified meaningful — removing the lock makes loom
+  report the torn read), and the MM-4 resume forwarding. Run with
+  `RUSTFLAGS="--cfg loom" cargo test -p newgc-core --test loom_safepoint`.
+  (Liveness — the cross-cycle straggler deadlock — is a progress property
+  loom doesn't check directly; covered by the targeted analysis + stress.)
+- **Config** — `GcCoordinator::set_safepoint_timeout` /
+  `safepoint_timeout` make the driver's per-arrival wait budget
+  configurable (`Safepoint::wait_timeout_ms`, default 10 s, clamped ≥ 1 ms).
+  It is a diagnostic *re-check* backstop, not a "proceed after N s" — the
+  protocol doesn't depend on it. Test: `safepoint_timeout_is_configurable`.
+  (`safepoint_per_alloc` debug flag + telemetry hooks: deferred — not
+  needed for soundness; flag here for the frontend backlog.)
+- **Docs** — rewrote `docs/threading.md` from the pre-MM "no safepoint
+  API / until steps 1–4" state to the shipped `GcCoordinator`/`Mutator`
+  model (TLABs, safepoints, snapshot roots, native convention,
+  conservative pins, FFI pin, precise-only build, and what stays
+  single-threaded).
 
 ---
 

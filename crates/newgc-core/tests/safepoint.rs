@@ -11,6 +11,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
+use std::time::Duration;
 
 use newgc_core::{GcCoordinator, Generation, LispLayout, PAYLOAD_MASK, Tag, Word};
 
@@ -156,4 +157,65 @@ fn multi_worker_rooted_survival_under_concurrent_gc() {
     }
     seen.sort_unstable();
     assert_eq!(seen, vec![0xA000, 0xA001, 0xA002]);
+}
+
+// ---------------------------------------------------------------------------
+// MM-8: the safepoint wait-timeout (a diagnostic re-check backstop) is
+// configurable. It round-trips, clamps to >= 1 ms, and a normal
+// cooperative collection still works under a short value (a worker parks
+// well before the timeout fires; its root survives + is forwarded).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn safepoint_timeout_is_configurable() {
+    let coord = Coord::with_reservation(16 * 64 * 1024);
+
+    assert_eq!(coord.safepoint_timeout(), Duration::from_secs(10), "default");
+    coord.set_safepoint_timeout(Duration::from_millis(250));
+    assert_eq!(coord.safepoint_timeout(), Duration::from_millis(250));
+    coord.set_safepoint_timeout(Duration::from_millis(0));
+    assert_eq!(
+        coord.safepoint_timeout(),
+        Duration::from_millis(1),
+        "clamped to >= 1 ms so the driver's wait can't busy-spin"
+    );
+
+    // Functional under a short timeout: a cooperating worker parks long
+    // before 100 ms, so collection proceeds normally.
+    coord.set_safepoint_timeout(Duration::from_millis(100));
+    let ready = Arc::new(Barrier::new(2));
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker = thread::spawn({
+        let c = coord.clone();
+        let ready = Arc::clone(&ready);
+        let stop = Arc::clone(&stop);
+        move || {
+            let mut m = c.register_mutator();
+            let p = m.try_alloc_cons_in(Generation::G0).unwrap();
+            unsafe {
+                *p.as_ptr() = Word::fixnum(0x9090).raw();
+                *p.as_ptr().add(1) = Word::NIL.raw();
+            }
+            let mut roots = [Word::from_ptr(p.as_ptr() as *const u8, Tag::Cons)];
+            ready.wait();
+            while !stop.load(Ordering::Acquire) {
+                m.poll_safepoint(&mut roots);
+                assert_eq!(car_fixnum(roots[0]), Some(0x9090));
+                std::hint::spin_loop();
+            }
+            m.poll_safepoint(&mut roots);
+            car_fixnum(roots[0])
+        }
+    });
+
+    let mut driver = coord.register_mutator();
+    ready.wait();
+    let mut dr: [Word; 0] = [];
+    for _ in 0..5 {
+        driver.collect_minor(&mut dr, |_| {});
+        thread::yield_now();
+    }
+    stop.store(true, Ordering::Release);
+    driver.collect_minor(&mut dr, |_| {});
+    assert_eq!(worker.join().expect("worker panicked"), Some(0x9090));
 }

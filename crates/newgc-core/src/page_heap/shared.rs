@@ -44,7 +44,17 @@ pub struct Safepoint {
     pub(crate) park_mutex: Mutex<()>,
     /// Mutators wait here for resume; the driver waits here for arrivals.
     pub(crate) park_cv: Condvar,
+    /// Per-arrival `wait_timeout` budget, in milliseconds (default
+    /// `DEFAULT_SAFEPOINT_TIMEOUT_MS`). A diagnostic backstop only — the
+    /// protocol does not rely on it; it bounds how long a driver waits on
+    /// a single non-cooperating mutator before re-checking. Settable via
+    /// `GcCoordinator::set_safepoint_timeout`. Relaxed: read once per
+    /// wait, set rarely; exact cross-thread freshness doesn't matter.
+    pub(crate) wait_timeout_ms: AtomicU64,
 }
+
+/// Default safepoint per-arrival wait budget (10 s).
+pub(crate) const DEFAULT_SAFEPOINT_TIMEOUT_MS: u64 = 10_000;
 
 impl Safepoint {
     fn new() -> Self {
@@ -53,6 +63,7 @@ impl Safepoint {
             world_running: AtomicU8::new(1),
             park_mutex: Mutex::new(()),
             park_cv: Condvar::new(),
+            wait_timeout_ms: AtomicU64::new(DEFAULT_SAFEPOINT_TIMEOUT_MS),
         }
     }
 }

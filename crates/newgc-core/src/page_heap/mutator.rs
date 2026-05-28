@@ -306,6 +306,28 @@ impl<L: HeapLayout> GcCoordinator<L> {
         self.registry.live_count()
     }
 
+    /// Set the per-arrival safepoint wait-timeout — the diagnostic
+    /// backstop a driver uses when waiting on a single mutator to park
+    /// (design §4.4). The default is 10 s; the protocol does not depend on
+    /// it (a cooperating mutator parks long before it fires), so this only
+    /// bounds how quickly a driver re-checks a stuck/non-cooperating
+    /// thread. Affects every subsequent collection. Clamped to ≥ 1 ms so
+    /// the driver's wait can't busy-spin.
+    pub fn set_safepoint_timeout(&self, timeout: Duration) {
+        let ms = timeout.as_millis().clamp(1, u64::MAX as u128) as u64;
+        let shared = self.heap.lock().unwrap().shared_handle();
+        shared
+            .safepoint
+            .wait_timeout_ms
+            .store(ms, Ordering::Relaxed);
+    }
+
+    /// Current safepoint wait-timeout (diagnostic / test hook).
+    pub fn safepoint_timeout(&self) -> Duration {
+        let shared = self.heap.lock().unwrap().shared_handle();
+        Duration::from_millis(shared.safepoint.wait_timeout_ms.load(Ordering::Relaxed))
+    }
+
     /// Run a closure with exclusive `&mut PageHeap`. Locks the heap
     /// mutex for the duration — allocation by any mutator is excluded.
     /// Escape hatch for diagnostics/tests; collection should go through
@@ -848,11 +870,10 @@ impl<L: HeapLayout> Mutator<L> {
                         && m.state.load(Ordering::Acquire) != IN_NATIVE
                         && m.last_epoch.load(Ordering::Acquire) < target
                     {
-                        guard = sp
-                            .park_cv
-                            .wait_timeout(guard, Duration::from_secs(10))
-                            .unwrap()
-                            .0;
+                        let budget = Duration::from_millis(
+                            sp.wait_timeout_ms.load(Ordering::Relaxed),
+                        );
+                        guard = sp.park_cv.wait_timeout(guard, budget).unwrap().0;
                     }
                 }
             }
