@@ -185,19 +185,25 @@ impl GcStallError {
 /// surface it here so clients can decide what to do (drop the heap,
 /// grow it, log + abort, etc.) without process termination.
 ///
-/// **Heap state after a `GcError`:** indeterminate. Some objects
-/// may have been copied with forwarding markers; the corresponding
-/// destination pages may exist; cards may be partially marked. The
-/// heap should not be used for further mutator allocations. Calling
-/// another `try_*` GC on it is technically possible but the
-/// behaviour is undefined — the GC has not been designed for
-/// resumption from a partial state. The safe response is to drop
-/// the heap and either abort or rebuild.
+/// **Heap state after a `GcError`:** indeterminate (the heap is now
+/// "poisoned"). Some objects may have been copied with forwarding
+/// markers; the corresponding destination pages may exist; cards
+/// may be partially marked. The heap is no longer safe for mutator
+/// allocations or further GC cycles — `try_collect_*` on a poisoned
+/// heap short-circuits to [`GcError::HeapPoisoned`] without
+/// attempting another collection (a second mid-state collect would
+/// compound the corruption rather than recover). The safe response
+/// is to drop the heap and either abort or rebuild from durable
+/// state. `Drop` itself is always safe to run.
 #[derive(Clone, Debug)]
 pub enum GcError {
     /// Mid-evacuation out of memory. Contains the underlying
     /// `GcStallError` diagnostic.
     MidEvacOom(GcStallError),
+    /// Heap was already poisoned by an earlier failed `try_collect_*`
+    /// — no fresh diagnostic is generated because no collection ran.
+    /// Drop the heap.
+    HeapPoisoned,
 }
 
 impl GcError {
@@ -208,6 +214,12 @@ impl GcError {
                 0,
                 0,
             ),
+            GcError::HeapPoisoned => {
+                "gc-stall: reason=HeapPoisoned trigger=try_collect (heap \
+                 was poisoned by an earlier failed try_collect; drop the \
+                 heap and rebuild)"
+                    .to_string()
+            }
         }
     }
 }
@@ -341,7 +353,10 @@ impl<'a, L: HeapLayout> PageEvacuator<'a, L> {
         // address. Pin all pages in the run so phase3_reclaim flips their
         // generation in-place. Record the head cell in pinned_cells so
         // phase2_rewrite can walk the large object's payload and fix up
-        // any pointers to evacuated small objects.
+        // any pointers to evacuated small objects. Also mark the head cell
+        // and queue it for payload BFS — without this, small cells reached
+        // only via a Large object's heap-pointer payload would be missed
+        // by the mark pass and reclaimed.
         if kind == PageKind::Large {
             // Find the head page (a slot should always point to a head cell,
             // but scan backwards defensively for a cont page).
@@ -354,6 +369,12 @@ impl<'a, L: HeapLayout> PageEvacuator<'a, L> {
                 }
                 h
             };
+            let head_cell = head_page_idx * PAGE_SIZE_CELLS;
+            // Mark first; if we've already seen this Large head via another
+            // root, the pin + queue work below was done on the earlier visit.
+            if self.heap.mark_cell(head_cell) {
+                return;
+            }
             let n_span = self.heap.desc(head_page_idx).n_span as usize;
             // Pin every page in the run so phase3_reclaim flips them all.
             for i in 0..n_span {
@@ -363,8 +384,10 @@ impl<'a, L: HeapLayout> PageEvacuator<'a, L> {
             // Record only the head cell in pinned_cells.
             // rewrite_pinned_object will walk the header to find the full
             // payload extent (which spans all pages in the run).
-            let head_cell = head_page_idx * PAGE_SIZE_CELLS;
             self.heap.pinned_cells.insert(head_cell);
+            // Queue for payload BFS so heap-pointer fields inside the Large
+            // object reach `mark_scan_object` and their children get marked.
+            self.mark_queue.push(head_cell);
             // Leave the slot unchanged — the large object didn't move.
             return;
         }
@@ -411,7 +434,13 @@ impl<'a, L: HeapLayout> PageEvacuator<'a, L> {
                 self.heap.start_bits_slice(),
                 cell_idx,
             ),
-            _ => return,
+            // A Large object's head cell carries a boxed-style HeapHeader;
+            // its payload may span multiple contiguous pages in the
+            // reservation but indexes the same global cell space. Decoding
+            // via `L::header_layout` gives the pointer-cell range across
+            // the whole run.
+            PageKind::Large => false,
+            PageKind::Free => return,
         };
         let (payload_start, payload_end_inclusive) = if is_cons {
             (cell_idx, cell_idx + 1)
@@ -565,6 +594,14 @@ impl<L: HeapLayout> PageHeap<L> {
             drop(marker);
             self.prepare_recycle_live_counts_from_marks(from_gen);
         }
+
+        // MM-0: fold persistent explicit (FFI) pins into this cycle's
+        // pin state and mark their children. Must run after the mark /
+        // recycle-count seed is established and before the pinned-cells
+        // snapshot below. `clear_all_pins` (end of cycle) wipes the
+        // per-cycle pin set, so this re-applies the durable pins every
+        // evacuation.
+        self.apply_explicit_pins(from_gen);
 
         // Snapshot the pinned cells with their is_cons bit BEFORE
         // any start-bit clearing happens. Each chunk's Phase 3 uses
@@ -1178,7 +1215,6 @@ impl<L: HeapLayout> PageHeap<L> {
         })
     }
 }
-
 /// Module-level helper: read a raw u64 from a global cell index.
 /// Free-function form to avoid clashing with `mark::PageHeap::read_cell`
 /// (which is private to that module).
@@ -2136,6 +2172,52 @@ mod tests {
     }
 
     #[test]
+    fn g0_to_g0_evacuation_bypasses_mutator_young_cap() {
+        // 2 young pages + 6 old pages => reservation of 8 pages.
+        // Mutator allocation should stop opening fresh G0 pages at 2,
+        // but GC-internal G0->G0 evacuation still needs to copy into
+        // fresh G0 pages during a minor cycle.
+        let mut h = PageHeap::<crate::lisp_layout::LispLayout>::new(
+            2 * 64 * 1024,
+            6 * 64 * 1024,
+        );
+        let mut roots = Vec::new();
+
+        for marker in 0..2 {
+            let ptr = h
+                .try_alloc_boxed_in(Generation::G0, PAGE_SIZE_CELLS)
+                .expect("one page-sized object per young page");
+            unsafe {
+                *ptr.as_ptr() =
+                    HeapHeader::new(HeapType::Vector, (PAGE_SIZE_CELLS - 1) as u32).raw();
+                for i in 1..PAGE_SIZE_CELLS {
+                    *ptr.as_ptr().add(i) = Word::fixnum(marker).raw();
+                }
+            }
+            roots.push(Word::from_ptr(ptr.as_ptr() as *const u8, Tag::Vector));
+        }
+
+        assert_eq!(h.count_pages_in_gen(Generation::G0), 2);
+        assert_eq!(h.count_pages_in_gen(Generation::Free), 6);
+
+        let result = h.evacuate_from_word_roots(
+            Generation::G0,
+            Generation::G0,
+            roots.as_mut_slice(),
+        );
+
+        assert_eq!(result.objects_copied, 2);
+        assert_eq!(h.count_pages_in_gen(Generation::G0), 2);
+        assert_eq!(h.count_pages_in_gen(Generation::Free), 6);
+
+        for root in &roots {
+            let addr = (root.raw() & crate::word::PAYLOAD_MASK) as *const u8;
+            let page = h.page_of(addr).expect("root in heap");
+            assert_eq!(h.desc(page).generation, Generation::G0);
+        }
+    }
+
+    #[test]
     fn marked_within_gen_evacuation_recycles_from_pages() {
         let mut h = small_heap();
         let mut roots = Vec::new();
@@ -2246,3 +2328,4 @@ mod tests {
         }
     }
 }
+

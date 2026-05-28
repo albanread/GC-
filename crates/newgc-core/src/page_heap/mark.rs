@@ -160,9 +160,11 @@ impl<L: HeapLayout> PageHeap<L> {
         }
         // Bug #2 from the code review (docs/GC_DESIGN.md sub-phase
         // 6.5): even with a matching generation and a set start
-        // bit, a Free or Large page must never be followed.
+        // bit, a Free page must never be followed. Large pages are
+        // legal targets — their head cell carries a HeapHeader and
+        // their payload may hold heap pointers we need to walk.
         let kind = self.desc(page_idx).kind;
-        if !matches!(kind, PageKind::Cons | PageKind::Boxed) {
+        if !matches!(kind, PageKind::Cons | PageKind::Boxed | PageKind::Large) {
             return;
         }
         // Convert to global cell index.
@@ -214,10 +216,13 @@ impl<L: HeapLayout> PageHeap<L> {
                 is_cons_start_at(self.start_bits_slice(), cell_idx)
             }
             PageKind::Large => {
-                // Sub-phase 7 will define large-object marking
-                // shape. For now, skip — the test workloads
-                // don't allocate Large.
-                return;
+                // A Large object's head cell carries a boxed-style
+                // HeapHeader; its payload may span multiple
+                // contiguous pages but indexes the same global cell
+                // space. Fall through to the boxed-style path so
+                // `L::header_layout` decodes the pointer range
+                // across the whole run.
+                false
             }
             PageKind::Free => {
                 // Bug #2 from the code review: try_mark_root rejects
@@ -293,7 +298,10 @@ impl<L: HeapLayout> PageHeap<L> {
             let page_idx = cell_idx / PAGE_SIZE_CELLS;
             let pinned_gen = marker.heap.desc(page_idx).generation;
             // Same-gen pins are covered by `extend_mark_from_pinned(target)`.
-            // Free and Large pages aren't legal pin targets.
+            // Free pages aren't legal pin targets; Large pages are
+            // (the conservative pin scan doesn't filter by kind, and
+            // a Large object's payload may hold cross-gen pointers
+            // into `target` that this walk must propagate).
             if pinned_gen == target {
                 continue;
             }
@@ -304,7 +312,7 @@ impl<L: HeapLayout> PageHeap<L> {
                 continue;
             }
             let kind = marker.heap.desc(page_idx).kind;
-            if !matches!(kind, PageKind::Cons | PageKind::Boxed) {
+            if !matches!(kind, PageKind::Cons | PageKind::Boxed | PageKind::Large) {
                 continue;
             }
             if !is_start_at(marker.heap.start_bits_slice(), cell_idx) {
@@ -376,7 +384,7 @@ impl<L: HeapLayout> PageHeap<L> {
                 continue;
             }
             let kind = marker.heap.desc(page_idx).kind;
-            if !matches!(kind, PageKind::Cons | PageKind::Boxed) {
+            if !matches!(kind, PageKind::Cons | PageKind::Boxed | PageKind::Large) {
                 continue;
             }
             if !is_start_at(marker.heap.start_bits_slice(), cell_idx) {

@@ -263,9 +263,21 @@ impl<L: HeapLayout> PageHeap<L> {
         n_cells: usize,
         is_cons: bool,
     ) -> Option<NonNull<u64>> {
+        // Poisoned heaps refuse allocations — see PageHeap::is_poisoned.
+        // We can't safely hand out cells when forwarding markers and a
+        // partial pin set may still be in place.
+        if self.poisoned {
+            return None;
+        }
         // Try the fast path — fits in the current region.
         if let Some(ptr) = self.try_bump_in_current(generation, kind, n_cells, is_cons) {
             return Some(ptr);
+        }
+        if generation == Generation::G0
+            && !self.recycle_live_counts_active_for(Generation::G0)
+            && self.count_pages_in_gen(Generation::G0) >= self.young_page_cap
+        {
+            return None;
         }
         // Slow path: acquire a fresh page and retry. The retry
         // can still fail if a single allocation exceeds the page
@@ -350,11 +362,29 @@ impl<L: HeapLayout> PageHeap<L> {
         n_cells: usize,
         generation: Generation,
     ) -> Option<std::ptr::NonNull<u64>> {
+        if self.poisoned {
+            return None;
+        }
         let n_pages = n_cells.div_ceil(PAGE_SIZE_CELLS);
         debug_assert!(
             n_pages >= 1,
             "try_alloc_large called with n_cells={n_cells}"
         );
+
+        // Mirror the small-object young_page_cap gate: a Large
+        // allocation into G0 also opens fresh G0 pages (n_pages of
+        // them) and must respect the cap, except when called from
+        // GC-internal evacuation paths (signalled by an active
+        // recycle-counts target for G0).
+        if generation == Generation::G0
+            && !self.recycle_live_counts_active_for(Generation::G0)
+            && self
+                .count_pages_in_gen(Generation::G0)
+                .saturating_add(n_pages)
+                > self.young_page_cap
+        {
+            return None;
+        }
 
         // Find the first run of n_pages contiguous Free pages.
         let start_idx = self.find_contiguous_free_pages(n_pages)?;
@@ -440,6 +470,7 @@ impl<L: HeapLayout> PageHeap<L> {
 mod tests {
     use super::*;
     use super::super::page_desc::Generation;
+    use super::super::space::PAGE_SIZE_BYTES;
 
     fn small_heap() -> PageHeap<crate::lisp_layout::LispLayout> {
         // 8 pages = 512 KB. Enough to exercise multi-page allocation
@@ -579,6 +610,43 @@ mod tests {
         }
         // 33rd alloc onto a fresh page fails — no free pages.
         assert!(h.try_alloc_cons_in(Generation::G0).is_none());
+    }
+
+    #[test]
+    fn g0_large_alloc_respects_young_page_cap() {
+        // young_bytes = 2 pages → cap = 2. A 2-page large alloc fits
+        // (count_pages_in_gen(G0)=0 + 2 ≤ 2). A second 2-page alloc
+        // would push G0 to 4 pages, exceeding the cap → refused.
+        let mut h = PageHeap::<crate::lisp_layout::LispLayout>::new(
+            2 * PAGE_SIZE_BYTES,
+            6 * PAGE_SIZE_BYTES,
+        );
+        let first = h.try_alloc_large(PAGE_SIZE_CELLS + 1, Generation::G0);
+        assert!(first.is_some(), "first 2-page large fits within cap");
+        assert_eq!(h.count_pages_in_gen(Generation::G0), 2);
+        let second = h.try_alloc_large(PAGE_SIZE_CELLS + 1, Generation::G0);
+        assert!(
+            second.is_none(),
+            "second 2-page large must be refused — would exceed young cap"
+        );
+    }
+
+    #[test]
+    fn g0_alloc_respects_young_page_cap() {
+        let mut h = PageHeap::<crate::lisp_layout::LispLayout>::new(
+            2 * PAGE_SIZE_BYTES,
+            6 * PAGE_SIZE_BYTES,
+        );
+        for _ in 0..(2 * (PAGE_SIZE_CELLS / 2)) {
+            assert!(h.try_alloc_cons_in(Generation::G0).is_some());
+        }
+        assert_eq!(h.count_pages_in_gen(Generation::G0), 2);
+        assert_eq!(h.count_pages_in_gen(Generation::Free), 6);
+        assert!(
+            h.try_alloc_cons_in(Generation::G0).is_none(),
+            "G0 should stop at the configured young-page cap"
+        );
+        assert_eq!(h.count_pages_in_gen(Generation::Free), 6);
     }
 
     #[test]

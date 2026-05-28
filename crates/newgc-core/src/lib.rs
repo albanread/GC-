@@ -29,6 +29,6 @@ pub use heap_common::{
 pub use word::{Tag, Word, FIXNUM_MAX, FIXNUM_MIN, PAYLOAD_MASK, TAG_BITS, TAG_MASK};
 pub use page_heap::{
     AllocRegion, CollectResult, EvacResult, FullCollectResult, Generation, PageDesc,
-    PageEvacuator, PageHeap, PageKind, PageStartBits, G0_PROMOTION_THRESHOLD,
+    PageEvacuator, PageHeap, PageKind, PageStartBits, PinHandle, G0_PROMOTION_THRESHOLD,
     G1_PROMOTION_THRESHOLD, PAGE_SIZE_BYTES, PAGE_SIZE_CELLS,
 };

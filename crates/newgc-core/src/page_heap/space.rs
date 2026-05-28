@@ -166,6 +166,16 @@ pub struct PageHeap<L: HeapLayout> {
     /// `pub(super)` so sibling modules (`pin`, future `evacuate`)
     /// can mutate without going through accessors.
     pub(super) pinned_cells: std::collections::HashSet<usize>,
+    /// Explicit (FFI) pins — MM-0. Maps a pinned object's global start
+    /// cell index to a refcount. Unlike `pinned_cells` (rebuilt every
+    /// cycle by the conservative scan and wiped by `clear_all_pins`),
+    /// this set is **persistent**: it survives collections and is
+    /// re-applied into `pinned_cells` + page pin-bytes at the start of
+    /// every evacuation (see `apply_explicit_pins`). An object stays at
+    /// a fixed address from `pin()` until the matching `unpin()`, across
+    /// any number of cycles — the guarantee FFI needs (object address
+    /// escaped into Win32 / held by a callback for the process lifetime).
+    pub(super) explicit_pins: std::collections::HashMap<usize, u32>,
     /// Per-page count of marked live object starts for the current
     /// recycling-enabled evacuation cycle. Zeroed when inactive.
     pub(super) recycle_live_counts: Vec<u16>,
@@ -236,6 +246,16 @@ pub struct PageHeap<L: HeapLayout> {
     /// Tenured-fill threshold for `should_collect_major`. Basis
     /// points (`10000 = 100%`). Default 7500 = 75% of reservation.
     pub(super) tenured_full_threshold_bps: u32,
+    /// Set to `true` when a GC cycle was aborted by `GcStallError`
+    /// (mid-evacuation OOM). Once poisoned, the heap state is
+    /// indeterminate — forwarding markers may sit in half-copied
+    /// from-pages, the pin set may be partially populated, card
+    /// bookkeeping may be out of sync. Subsequent `try_collect_*`
+    /// calls short-circuit to `Err` without attempting another
+    /// cycle (a second mid-state collect would compound corruption
+    /// rather than recover); allocation requests refuse rather than
+    /// hand out cells on a tainted heap. Only `Drop` is safe.
+    pub(super) poisoned: bool,
 }
 
 enum Backing {
@@ -388,6 +408,8 @@ impl<L: HeapLayout> PageHeap<L> {
         let mark_bits: Box<[u64]> = vec![0u64; n_mark_words].into_boxed_slice();
         // Pinned-cells set starts empty — no scan run yet.
         let pinned_cells = std::collections::HashSet::new();
+        // Explicit (FFI) pins — persistent, starts empty.
+        let explicit_pins = std::collections::HashMap::new();
         let recycle_live_counts = vec![0u16; n_pages];
         // Card table covering the whole reservation. Same 512-byte
         // card granularity as the semispace heap so the IR-level
@@ -422,6 +444,7 @@ impl<L: HeapLayout> PageHeap<L> {
                 start_bits,
                 mark_bits,
                 pinned_cells,
+                explicit_pins,
                 recycle_live_counts,
                 recycle_live_counts_target: None,
                 last_mark_live_cells: 0,
@@ -436,6 +459,7 @@ impl<L: HeapLayout> PageHeap<L> {
                 auto_gc_trigger_bytes: 8 * 1024 * 1024,
                 gc_budget_min_bytes: 8 * 1024 * 1024,
                 tenured_full_threshold_bps: 7500,
+                poisoned: false,
             }
         }
         #[cfg(unix)]
@@ -477,6 +501,7 @@ impl<L: HeapLayout> PageHeap<L> {
                 start_bits,
                 mark_bits,
                 pinned_cells,
+                explicit_pins,
                 recycle_live_counts,
                 recycle_live_counts_target: None,
                 last_mark_live_cells: 0,
@@ -491,6 +516,7 @@ impl<L: HeapLayout> PageHeap<L> {
                 auto_gc_trigger_bytes: 8 * 1024 * 1024,
                 gc_budget_min_bytes: 8 * 1024 * 1024,
                 tenured_full_threshold_bps: 7500,
+                poisoned: false,
             };
         }
         #[cfg(not(any(windows, unix)))]
@@ -518,6 +544,7 @@ impl<L: HeapLayout> PageHeap<L> {
                 start_bits,
                 mark_bits,
                 pinned_cells,
+                explicit_pins,
                 recycle_live_counts,
                 recycle_live_counts_target: None,
                 last_mark_live_cells: 0,
@@ -532,6 +559,7 @@ impl<L: HeapLayout> PageHeap<L> {
                 auto_gc_trigger_bytes: 8 * 1024 * 1024,
                 gc_budget_min_bytes: 8 * 1024 * 1024,
                 tenured_full_threshold_bps: 7500,
+                poisoned: false,
             }
         }
     }
@@ -742,12 +770,25 @@ impl<L: HeapLayout> PageHeap<L> {
 
     // -- Sub-phase 10 follow-up: try_* variants returning Result --------
 
+    /// True if a previous `try_collect_*` returned `Err` and the
+    /// heap is now in an indeterminate state (forwarding markers,
+    /// partial pin set, stale cards). Further GC calls short-circuit
+    /// to `Err`; allocation calls refuse. `Drop` is still safe.
+    ///
+    /// The intended client response is to drop the heap and either
+    /// abort the program or rebuild from durable state.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     /// `collect_minor` with mid-evacuation-OOM caught and returned
     /// as a `Result::Err(GcError::MidEvacOom)`. Use this in clients
     /// that need to handle out-of-memory without process termination.
     ///
-    /// **Important:** on `Err`, the heap is in an indeterminate
-    /// state — see [`super::evac::GcError`]'s docs. The safe response
+    /// **Important:** on `Err`, the heap is poisoned — see
+    /// [`PageHeap::is_poisoned`]. Subsequent `try_collect_*` calls
+    /// on the same heap will short-circuit to the same `Err`
+    /// payload without attempting another cycle. The safe response
     /// is to drop the heap.
     pub fn try_collect_minor<F>(
         &mut self,
@@ -756,10 +797,18 @@ impl<L: HeapLayout> PageHeap<L> {
     where
         F: FnMut(&mut super::evac::PageEvacuator<'_, L>),
     {
-        run_catching_oom(|| self.collect_minor(visit_roots))
+        if let Some(err) = self.poisoned_err() {
+            return Err(err);
+        }
+        let result = run_catching_oom(|| self.collect_minor(visit_roots));
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
     }
 
     /// `collect_major` with mid-evacuation-OOM caught as `Result::Err`.
+    /// Poisons the heap on `Err` — see [`PageHeap::try_collect_minor`].
     pub fn try_collect_major<F>(
         &mut self,
         visit_roots: F,
@@ -767,10 +816,18 @@ impl<L: HeapLayout> PageHeap<L> {
     where
         F: FnMut(&mut super::evac::PageEvacuator<'_, L>),
     {
-        run_catching_oom(|| self.collect_major(visit_roots))
+        if let Some(err) = self.poisoned_err() {
+            return Err(err);
+        }
+        let result = run_catching_oom(|| self.collect_major(visit_roots));
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
     }
 
     /// `collect_auto` with mid-evacuation-OOM caught as `Result::Err`.
+    /// Poisons the heap on `Err` — see [`PageHeap::try_collect_minor`].
     pub fn try_collect_auto<F>(
         &mut self,
         visit_roots: F,
@@ -778,7 +835,24 @@ impl<L: HeapLayout> PageHeap<L> {
     where
         F: FnMut(&mut super::evac::PageEvacuator<'_, L>),
     {
-        run_catching_oom(|| self.collect_auto(visit_roots))
+        if let Some(err) = self.poisoned_err() {
+            return Err(err);
+        }
+        let result = run_catching_oom(|| self.collect_auto(visit_roots));
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    /// If poisoned, return `GcError::HeapPoisoned`. Used by
+    /// `try_collect_*` to short-circuit before running another cycle.
+    fn poisoned_err(&self) -> Option<super::evac::GcError> {
+        if self.poisoned {
+            Some(super::evac::GcError::HeapPoisoned)
+        } else {
+            None
+        }
     }
 
     /// Sub-phase 9 of `docs/GC_DESIGN.md`.

@@ -334,6 +334,18 @@ impl<L: HeapLayout> PageHeap<L> {
     ///
     /// Both promotion counters are reset to 0 after this call.
     ///
+    /// ## Conservative-pin caveat
+    ///
+    /// `collect_full` does NOT preserve caller-supplied conservative-pin
+    /// state. Each evac pass ends with `clear_all_pins`, so a
+    /// `pin_pointers_in_ranges(Tenured, ...)` call made before
+    /// `collect_full` is wiped by pass 1's cleanup and pass 3 sees an
+    /// empty pin set. Callers that rely on conservative pinning must
+    /// supply every live object through the explicit-root closure; this
+    /// matches the contract that pass 3 "uses *only* the caller's
+    /// explicit roots." Regression coverage:
+    /// `tests/large_object.rs::vm1_collect_full_does_not_preserve_pre_pinned_tenured`.
+    ///
     /// ## When to call
     ///
     /// - `tenured_used_bytes / reserved_bytes > 0.70` (Tenured fill).

@@ -212,6 +212,273 @@ fn vm1_table_buckets_size_24000_cells() {
 // Test 6: collect_full reclaims dead Tenured large object
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Test 7: Large object's heap-pointer payload keeps small children alive
+// ---------------------------------------------------------------------------
+//
+// Regression for the gap surfaced by the May-2026 review: `mark_scan_object`
+// returned immediately for `PageKind::Large`, so a small G0 cell reached
+// ONLY via a Large object's payload was never marked. A minor cycle then
+// released the small cell's page to Free and the Large object's payload
+// pointer dangled (pointing into a zeroed Free page).
+
+#[test]
+fn vm1_large_payload_keeps_small_g0_child_alive_across_minor() {
+    let mut h = Heap::with_reservation(64 * 64 * 1024);
+
+    // Allocate a small G0 cons; remember its raw value so we can verify
+    // it's still readable after GC.
+    let small_ptr = h.try_alloc_cons_in(Generation::G0).unwrap();
+    unsafe {
+        *small_ptr.as_ptr() = Word::fixnum(0xdeed).raw();
+        *small_ptr.as_ptr().add(1) = Word::NIL.raw();
+    }
+    let small_word = Word::from_ptr(small_ptr.as_ptr() as *const u8, Tag::Cons);
+
+    // Allocate a 2-page large Vector and write the small cons pointer into
+    // its first payload cell. Treat the rest of the payload as fixnum
+    // padding so the layout walker only sees the one pointer.
+    let n_cells = PAGE_SIZE_CELLS + 1;
+    let large_ptr = h
+        .try_alloc_large(n_cells, Generation::G0)
+        .expect("large alloc");
+    unsafe {
+        let n_payload = (n_cells - 1) as u32;
+        (large_ptr.as_ptr() as *mut u64)
+            .write(HeapHeader::new(HeapType::Vector, n_payload).raw());
+        large_ptr.as_ptr().add(1).write(small_word.raw());
+        for i in 2..n_cells {
+            large_ptr.as_ptr().add(i).write(Word::fixnum(0).raw());
+        }
+        // Card barrier: the mutator just stored a heap pointer into a
+        // Large page. Tell the card table so any future card-only scan
+        // would see it. (Doesn't matter for an in-G0 reference today
+        // since the card scan skips G0, but it documents the contract.)
+        h.mark_card_at(large_ptr.as_ptr().add(1) as *const u8);
+    }
+    let large_word =
+        Word::from_ptr(large_ptr.as_ptr() as *const u8, Tag::Vector);
+    let mut root = [large_word];
+
+    // One minor cycle. Only the large object is rooted; the small cons is
+    // reachable only via the large object's payload pointer. In-gen G0
+    // evac will MOVE the small cons to a fresh G0 page; the test below
+    // dereferences the (possibly rewritten) payload pointer to find it
+    // wherever it ended up.
+    h.collect_minor(|evac| evac.visit(&mut root[0]));
+
+    // The Large object's payload pointer must still resolve to a live
+    // (non-Free) cell. If the mark BFS skipped the Large payload, the
+    // small cons would have been reclaimed and the payload pointer would
+    // either dangle (still referencing the old now-Free page) or — once
+    // rewriting also gets confused — point at garbage.
+    let payload_word = unsafe {
+        let large_addr =
+            (root[0].raw() & PAYLOAD_MASK) as *const u64;
+        Word::from_raw(*large_addr.add(1))
+    };
+    let payload_addr = payload_word.raw() & PAYLOAD_MASK;
+    let payload_page = h.page_of(payload_addr as *const u8).unwrap();
+    assert_ne!(
+        h.desc(payload_page).generation,
+        Generation::Free,
+        "Large object's payload pointer must reference a live (non-Free) \
+         page after minor GC"
+    );
+
+    // And the value at that cell must be the original sentinel (proves no
+    // dangle into garbage-zeroed memory).
+    let car = unsafe { Word::from_raw(*(payload_addr as *const u64)) };
+    assert_eq!(
+        car.as_fixnum(),
+        Some(0xdeed),
+        "child cons car must still hold its sentinel value"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: Large payload keeps small G0 child alive across cascade promotion
+// ---------------------------------------------------------------------------
+//
+// Same shape as Test 7, but runs enough minor cycles to drive the Large
+// object through G0 → G1 promotion AND the small child through whatever
+// cohort it ends up in. The Large object's payload pointer must follow
+// the (possibly moved) small child.
+
+#[test]
+fn vm1_large_payload_keeps_small_child_alive_across_promotion() {
+    let mut h = Heap::with_reservation(64 * 64 * 1024);
+
+    let small_ptr = h.try_alloc_cons_in(Generation::G0).unwrap();
+    unsafe {
+        *small_ptr.as_ptr() = Word::fixnum(0xbeef).raw();
+        *small_ptr.as_ptr().add(1) = Word::NIL.raw();
+    }
+    let small_word = Word::from_ptr(small_ptr.as_ptr() as *const u8, Tag::Cons);
+
+    let n_cells = PAGE_SIZE_CELLS + 1;
+    let large_ptr = h
+        .try_alloc_large(n_cells, Generation::G0)
+        .expect("large alloc");
+    unsafe {
+        let n_payload = (n_cells - 1) as u32;
+        (large_ptr.as_ptr() as *mut u64)
+            .write(HeapHeader::new(HeapType::Vector, n_payload).raw());
+        large_ptr.as_ptr().add(1).write(small_word.raw());
+        for i in 2..n_cells {
+            large_ptr.as_ptr().add(i).write(Word::fixnum(0).raw());
+        }
+        h.mark_card_at(large_ptr.as_ptr().add(1) as *const u8);
+    }
+    let large_word =
+        Word::from_ptr(large_ptr.as_ptr() as *const u8, Tag::Vector);
+    let mut root = [large_word];
+
+    for _ in 0..G0_PROMOTION_THRESHOLD * G1_PROMOTION_THRESHOLD {
+        h.collect_minor(|evac| evac.visit(&mut root[0]));
+    }
+
+    // Verify the Large is still readable and its payload pointer still
+    // resolves to a live cell holding the sentinel.
+    let payload_word = unsafe {
+        let large_addr =
+            (root[0].raw() & PAYLOAD_MASK) as *const u64;
+        Word::from_raw(*large_addr.add(1))
+    };
+    let payload_addr = payload_word.raw() & PAYLOAD_MASK;
+    let payload_page = h.page_of(payload_addr as *const u8).unwrap();
+    assert_ne!(
+        h.desc(payload_page).generation,
+        Generation::Free,
+        "child cell's page must be live after cascade promotion"
+    );
+    let car = unsafe { Word::from_raw(*(payload_addr as *const u64)) };
+    assert_eq!(
+        car.as_fixnum(),
+        Some(0xbeef),
+        "child cell value must persist through promotion"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: collect_full does NOT preserve conservative-pin state on Tenured
+// ---------------------------------------------------------------------------
+//
+// Documented gap from the May-2026 code review (S6): collect_full performs
+// three evac passes (G0→G1, G1→Tenured, Tenured→Tenured) and each pass
+// ends by clearing the pin set. The pass-3 Tenured compact therefore runs
+// with an empty pin set — even if the caller seeded pins via
+// `pin_pointers_in_ranges(Tenured, ...)` before invoking collect_full,
+// pass 1's cleanup wipes them.
+//
+// All current callers use precise roots only, so this is a feature gap
+// rather than a live bug. This test pins it down (heh) so a future change
+// that wires conservative-pin into collect_full will trip the assertion
+// and force the corresponding fix.
+
+#[cfg(feature = "conservative-pin")]
+#[test]
+fn vm1_collect_full_does_not_preserve_pre_pinned_tenured() {
+    let mut h = Heap::with_reservation(64 * 64 * 1024);
+    // Allocate a small object in G0 and promote it to Tenured.
+    let p = h.try_alloc_cons_in(Generation::G0).unwrap();
+    unsafe {
+        *p.as_ptr() = Word::fixnum(0xfeed).raw();
+        *p.as_ptr().add(1) = Word::NIL.raw();
+    }
+    let mut root = [Word::from_ptr(p.as_ptr() as *const u8, Tag::Cons)];
+    let total_minors =
+        G0_PROMOTION_THRESHOLD * G1_PROMOTION_THRESHOLD;
+    for _ in 0..total_minors {
+        h.collect_minor(|evac| evac.visit(&mut root[0]));
+    }
+    let tenured_addr = root[0].raw() & PAYLOAD_MASK;
+    let tenured_page = h.page_of(tenured_addr as *const u8).unwrap();
+    assert_eq!(h.desc(tenured_page).generation, Generation::Tenured);
+
+    // Build a fake "stack" containing the Tenured pointer and pre-pin.
+    let stack: Box<[u64]> = vec![root[0].raw()].into_boxed_slice();
+    let lo = stack.as_ptr() as usize;
+    let hi = unsafe { stack.as_ptr().add(stack.len()) } as usize;
+    let pin_result = h.pin_pointers_in_ranges(Generation::Tenured, &[(lo, hi)]);
+    assert_eq!(pin_result.n_objects, 1, "pre-pin must register the object");
+
+    // collect_full with NO explicit roots. Pass 1's clear_all_pins wipes
+    // our pre-pin; pass 3 then sees no roots and no pins, and the Tenured
+    // object is reclaimed.
+    let _ = h.collect_full(|_| {});
+
+    // Document the current behavior: the Tenured page is now Free.
+    // (When a future change preserves conservative pins across collect_full,
+    // this assertion will flip and the test should be inverted.)
+    assert_eq!(
+        h.desc(tenured_page).generation,
+        Generation::Free,
+        "collect_full currently does not preserve conservative-pin state \
+         on Tenured — if this assertion starts failing, conservative-pin \
+         support has been added and the test should be updated"
+    );
+
+    // Keep `stack` alive to the end of the test so the OS doesn't reuse
+    // its pages and confuse the pin scanner on the next run.
+    drop(stack);
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: Tight young_page_cap does not break in-flight evacuation
+// ---------------------------------------------------------------------------
+//
+// young_page_cap caps mutator-driven G0 growth between collections, but the
+// allocator must let GC-internal copies grow G0 beyond the cap during an
+// in-flight G0 → G0 evac. This test fills G0 right to the cap with rooted
+// data, then runs a minor cycle. If the cap were enforced for GC-internal
+// allocs, phase1_copy_chunk would panic via `panic_any(GcStallError)`.
+
+#[test]
+fn vm1_minor_collect_survives_tight_young_page_cap() {
+    use newgc_core::PAGE_SIZE_CELLS as CELLS;
+    // 2 young pages + 6 old pages. The cap is 2.
+    let mut h = Heap::new(2 * 64 * 1024, 6 * 64 * 1024);
+
+    // Fill G0 to the cap with rooted cons cells. We pack ~2 pages
+    // worth (cons cells use 2 cells each → 4096 conses per page).
+    let mut roots: Vec<Word> = Vec::new();
+    for i in 0..(2 * CELLS / 2) {
+        let p = h.try_alloc_cons_in(Generation::G0).expect("under cap");
+        unsafe {
+            *p.as_ptr() = Word::fixnum(i as i64).raw();
+            *p.as_ptr().add(1) = Word::NIL.raw();
+        }
+        roots.push(Word::from_ptr(p.as_ptr() as *const u8, Tag::Cons));
+    }
+    assert!(
+        h.try_alloc_cons_in(Generation::G0).is_none(),
+        "mutator must hit the young cap before GC"
+    );
+
+    // Minor cycle. With everything rooted, the survivors must go
+    // somewhere. The cap-bypass for GC-internal allocs lets that
+    // happen; without the bypass, this call would panic.
+    let n_before = roots.len();
+    h.collect_minor(|evac| {
+        for r in roots.iter_mut() {
+            evac.visit(r);
+        }
+    });
+    assert_eq!(roots.len(), n_before);
+
+    // After GC, every rooted cons must still be in a live (non-Free) page.
+    for r in &roots {
+        let addr = (r.raw() & PAYLOAD_MASK) as *const u8;
+        let page = h.page_of(addr).unwrap();
+        assert_ne!(
+            h.desc(page).generation,
+            Generation::Free,
+            "rooted cons must survive the tight-cap minor cycle"
+        );
+    }
+}
+
 #[test]
 fn vm1_collect_full_reclaims_dead_large_object_in_tenured() {
     // Promote a large object all the way to Tenured, then reclaim it.
