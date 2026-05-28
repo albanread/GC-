@@ -249,7 +249,7 @@ reaches safepoints via the ordinary poll path, already covered.
 
 ---
 
-## MM-7 — Conservative pins across mutators + precise-only feature  *(≈3 days; deps: MM-5)*
+## MM-7 — Conservative pins across mutators + precise-only feature  *(≈3 days; deps: MM-5)* — ✅ DONE
 
 **Design:** §5.3. **Goal:** per-mutator `parked_stack_range` +
 `set_stack_range`; the coordinator combines all active mutators' ranges
@@ -265,6 +265,31 @@ build that compiles the conservative scan out.
 
 **Done when:** conservative builds (NCL-shaped) work multi-mutator, and a
 precise-only build drops the scan cleanly.
+
+**Shipped:** per-mutator `stack_lo`/`stack_hi: AtomicUsize` on
+`MutatorInner` (cfg-gated to `conservative-pin`, so a precise-only build
+carries zero extra surface); `Mutator::set_stack_range(lo, hi)`. The
+driver, under the world-stopped barrier with the heap locked, unions
+every active mutator's `[lo, hi)` window (its own slot included via the
+registry snapshot) and calls `pin_pointers_in_ranges` for the moving
+generations (minor: G0+G1; full: G0+G1+Tenured) *before* the evac reads
+the pin set — the pin pass itself is unchanged (§5.3). `precise-roots-only`
+is `--no-default-features`: the union/scan and the stack-range fields
+compile out, and the `pin_gens` argument is discarded. Tests in
+`tests/conservative_mt.rs`: `conservative_pins_combine_across_mutators`
+(two mutators each publish a window holding the *sole* reference to a
+cons; one driver cycle unions both windows and both conses survive in
+place on the pin alone — cfg `conservative-pin`) and
+`precise_roots_only_keeps_objects_alive` (snapshot roots alone keep +
+forward an object, no window — unconditional). Full workspace green
+under **both** `--features` configs (default and `--no-default-features`).
+
+Note (scope): conservative pins keep stack-referenced objects *fixed*
+(their core contract) and keep childless / precise-rooted pinned objects
+alive. Survival of an unrooted pinned object's transitive *heap children*
+relies on extension marking, which NCL's fork drives through its own
+`mark_minor_with_static` + `collect_minor_with_static` path; the
+multi-mutator core does not add that pass to the snapshot-roots driver.
 
 ---
 

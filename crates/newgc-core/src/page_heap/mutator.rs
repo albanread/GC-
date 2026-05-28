@@ -20,6 +20,8 @@
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+#[cfg(feature = "conservative-pin")]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -146,6 +148,17 @@ struct MutatorInner {
     /// until the 10 s timeout. Mutator stores Release (after publishing
     /// roots + flushing TLABs); driver loads Acquire.
     state: AtomicU8,
+    /// Conservative stack-scan window `[lo, hi)` published by the owning
+    /// mutator (design §5.3, `conservative-pin` only). The driver unions
+    /// every active mutator's window into the slice handed to
+    /// `pin_pointers_in_ranges`, pinning pointer-shaped stack words so
+    /// stack-resident copies the collector can't rewrite stay valid.
+    /// `lo >= hi` (default `0, 0`) means "no window." Mutator stores
+    /// Release; driver loads Acquire under the world-stopped barrier.
+    #[cfg(feature = "conservative-pin")]
+    stack_lo: AtomicUsize,
+    #[cfg(feature = "conservative-pin")]
+    stack_hi: AtomicUsize,
 }
 
 impl MutatorInner {
@@ -158,6 +171,10 @@ impl MutatorInner {
             is_acting_coordinator: AtomicBool::new(false),
             roots_snapshot: Mutex::new(Vec::new()),
             state: AtomicU8::new(IN_DYLAN),
+            #[cfg(feature = "conservative-pin")]
+            stack_lo: AtomicUsize::new(0),
+            #[cfg(feature = "conservative-pin")]
+            stack_hi: AtomicUsize::new(0),
         }
     }
 }
@@ -695,6 +712,24 @@ impl<L: HeapLayout> Mutator<L> {
         roots[..n].copy_from_slice(&snap[..n]);
     }
 
+    // -- MM-7: conservative stack pins across mutators (design §5.3) ------
+
+    /// Publish this mutator's conservative stack-scan window `[lo, hi)`
+    /// (design §5.3, `conservative-pin` builds only). During a collection
+    /// the driver unions every active mutator's window and scans it for
+    /// pointer-shaped `Word`s, pinning their targets so a stack-resident
+    /// pointer the moving collector cannot rewrite stays valid.
+    ///
+    /// Call before reaching a safepoint, with bounds covering every stack
+    /// slot that may hold a live `Word` (typically the thread's full
+    /// stack span). `lo >= hi` clears the window. No-op in precise-only
+    /// builds (compiled out with the `conservative-pin` feature).
+    #[cfg(feature = "conservative-pin")]
+    pub fn set_stack_range(&mut self, lo: usize, hi: usize) {
+        self.inner().stack_lo.store(lo, Ordering::Release);
+        self.inner().stack_hi.store(hi, Ordering::Release);
+    }
+
     /// Drive a **minor** collection from this mutator's thread (design
     /// §2.5/§4.4). Self-parks (publishes `roots`, flushes TLABs, marks
     /// itself acting-coordinator), requests the safepoint, waits for
@@ -708,7 +743,14 @@ impl<L: HeapLayout> Mutator<L> {
     where
         F: FnMut(&mut PageEvacuator<'_, L>),
     {
-        self.drive_collect(roots, |heap, visit| heap.collect_minor(visit), extra)
+        // Conservative pins cover the generations a minor cycle moves: G0
+        // always, and G1 when a cascade promotes G1→Tenured (§5.3).
+        self.drive_collect(
+            roots,
+            |heap, visit| heap.collect_minor(visit),
+            &[Generation::G0, Generation::G1],
+            extra,
+        )
     }
 
     /// Drive a **full** collection from this mutator's thread.
@@ -716,16 +758,24 @@ impl<L: HeapLayout> Mutator<L> {
     where
         F: FnMut(&mut PageEvacuator<'_, L>),
     {
-        self.drive_collect(roots, |heap, visit| heap.collect_full(visit), extra)
+        // A full cycle can move objects in every generation.
+        self.drive_collect(
+            roots,
+            |heap, visit| heap.collect_full(visit),
+            &[Generation::G0, Generation::G1, Generation::Tenured],
+            extra,
+        )
     }
 
     /// Shared driver body for `collect_minor` / `collect_full`. `run`
     /// invokes the chosen `PageHeap` collector with the combined root
-    /// visitor.
+    /// visitor; `pin_gens` are the generations to conservatively pin from
+    /// the mutators' stack windows (`conservative-pin` only).
     fn drive_collect<R, C, F>(
         &mut self,
         roots: &mut [Word],
         run: C,
+        pin_gens: &[Generation],
         mut extra: F,
     ) -> R
     where
@@ -807,10 +857,42 @@ impl<L: HeapLayout> Mutator<L> {
                 }
             }
 
-            // (d) World stopped. Lock the heap and collect, visiting the
-            //     caller's extra roots plus every active mutator's
-            //     published snapshot (updated in place by the evacuator).
+            // (d) World stopped. Lock the heap.
             let mut heap = self.heap.lock().unwrap();
+
+            // (d.1) Conservative stack pins (§5.3, `conservative-pin`):
+            //       union every active mutator's published stack window and
+            //       pin pointer-shaped words into the moving generations, so
+            //       a stack-resident pointer the moving collector cannot
+            //       rewrite stays valid. Runs before the evac reads the pin
+            //       set; `others` already includes this driver's own slot,
+            //       so the driver's window (if any) is covered too. Compiled
+            //       out entirely in precise-only builds.
+            #[cfg(feature = "conservative-pin")]
+            {
+                let mut ranges: Vec<(usize, usize)> = Vec::new();
+                for m in &others {
+                    if !m.is_active.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let lo = m.stack_lo.load(Ordering::Acquire);
+                    let hi = m.stack_hi.load(Ordering::Acquire);
+                    if lo < hi {
+                        ranges.push((lo, hi));
+                    }
+                }
+                if !ranges.is_empty() {
+                    for &g in pin_gens {
+                        heap.pin_pointers_in_ranges(g, &ranges);
+                    }
+                }
+            }
+            #[cfg(not(feature = "conservative-pin"))]
+            let _ = pin_gens;
+
+            // (d.2) Collect, visiting the caller's extra roots plus every
+            //       active mutator's published snapshot (updated in place by
+            //       the evacuator).
             let r = run(&mut heap, &mut |evac| {
                 extra(evac);
                 for m in &others {
