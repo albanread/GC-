@@ -40,7 +40,7 @@ Total ≈ 30 engineer-days for the full sequence (MM-0 ≈ 3; multi-mutator ≈ 
 
 ---
 
-## MM-0 — Explicit FFI `pin` / `unpin` API  *(≈3 days, no deps, DO NOW)*
+## MM-0 — Explicit FFI `pin` / `unpin` API  *(≈3 days, no deps)* — ✅ DONE
 
 **Design:** §5.4. **Why first:** smallest, self-contained, single-mutator-
 compatible, unblocks both frontends; the others can wait.
@@ -75,7 +75,7 @@ cycle kind.
 
 ---
 
-## MM-1 — `Mutator<L>` handle, serialized  *(≈3 days, no deps)*
+## MM-1 — `Mutator<L>` handle, serialized  *(≈3 days, no deps)* — ✅ DONE
 
 **Design:** §2.1–2.3, Phase 1. **Goal:** introduce the handle API shape
 with **no perf change** — `Arc<Mutex<PageHeap>>` inside; `Mutator`
