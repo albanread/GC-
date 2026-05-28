@@ -2,63 +2,127 @@
 
 ## Current state
 
-`PageHeap<L>` implements `Send + Sync` — the type-system assertion that it is safe to share across threads. In practice, what "safe" means depends on how you use it.
+There are **two** supported deployment models:
 
-### What works today
+1. **Single heap, single owner** — `PageHeap<L>` used directly by one
+   thread (or behind your own `Mutex`). The original model; still valid.
+2. **Multi-mutator via `GcCoordinator<L>`** — many threads each hold a
+   `Mutator<L>` handle, allocate from per-thread TLABs lock-free, and
+   cooperate at safepoints so any one of them can drive a stop-the-world
+   collection that sees every thread's roots. This is the model the
+   multi-mutator sprints (MM-0..MM-8) delivered.
 
-**Independent heaps per thread.** Each thread constructs its own `PageHeap` and never shares it. Allocations, collections, and root walks are all thread-local with no coordination. This is the intended deployment model for Phase 1 and the pattern used by the threading test suite.
+`PageHeap<L>` is `Send + Sync`. `Mutator<L>` is intentionally **`!Send`**
+— a handle is bound to the thread that registered it (it owns
+thread-local TLABs and a stack window). `GcCoordinator<L>` is `Clone +
+Send + Sync`; clone it to hand a registration capability to each thread.
+
+### Multi-mutator model (`GcCoordinator`)
 
 ```rust
-let handles: Vec<_> = (0..4).map(|_| {
-    std::thread::spawn(|| {
-        let mut heap = PageHeap::<LispLayout>::with_reservation(64 * 1024 * 1024);
-        // ... allocate and collect independently
-    })
-}).collect();
-```
+let coord = GcCoordinator::<LispLayout>::with_reservation(1 << 30);
 
-**Shared heap via `Mutex`.** One heap is wrapped in `Arc<Mutex<PageHeap<L>>>` and multiple threads allocate from it. Allocation is serialised through the lock. Collection is also serialised — the thread that acquires the lock runs the cycle, everyone else blocks.
-
-```rust
-let heap = Arc::new(Mutex::new(PageHeap::<LispLayout>::with_reservation(1 << 30)));
-let h = Arc::clone(&heap);
+// Each thread registers its own (!Send) handle.
+let c = coord.clone();
 std::thread::spawn(move || {
-    let mut g = h.lock().unwrap();
-    let cell = g.try_alloc_cons_in(Generation::G0);
+    let mut m = c.register_mutator();
+    let p = m.try_alloc_cons_in(Generation::G0).unwrap();
+    // ... build roots ...
+    let mut roots = [/* live Words */];
+    loop {
+        m.poll_safepoint(&mut roots); // cooperate; parks if a cycle is pending
+        // ... mutate; roots are forwarded in place across a collection ...
+    }
 });
+
+// Any registered mutator can drive a collection from its own thread:
+let mut driver = coord.register_mutator();
+driver.collect_minor(&mut driver_roots, |_evac| { /* extra roots */ });
 ```
 
-This is correct but slow. Every allocation acquires a mutex; contention on the lock becomes the bottleneck under parallel workloads.
+What the coordinator provides:
 
-**Concurrent lock-free reads.** `committed_pages()`, `page_count()`, `reserved_bytes()`, and `base_ptr()` use `AtomicU64` loads and can be called from any thread without a lock, including while another thread holds the heap mutex.
+- **Per-mutator TLABs, lock-free bump (MM-3).** Each `(generation, kind)`
+  has a thread-local allocation buffer; the fast path is a pointer bump
+  with no lock. The heap mutex is taken only to refill an exhausted TLAB
+  or to run a collection.
+- **Cooperative safepoints (MM-4).** A global `epoch` + `world_running`
+  flag + a park condvar. `poll_safepoint` is a cheap epoch compare on the
+  fast path; when a collection is pending it **parks** the caller
+  (publishing roots, flushing TLABs) until the world resumes. A driver
+  self-parks, stops the world, waits for every *other* active mutator to
+  park at the same epoch, collects, and resumes. Registration is
+  serialized with STW via `coord_mutex`, so a newcomer can't slip into a
+  cycle in progress.
+- **Per-mutator snapshot roots (MM-5).** Before parking, each mutator
+  publishes its live `Word`s into a snapshot the coordinator visits and
+  **updates in place**; on resume the mutator copies the (possibly
+  forwarded) values back. This is what makes multi-mutator STW *sound* —
+  every thread's roots are seen, and none runs while the heap moves.
+- **Native-call convention (MM-6).** `enter_native`/`leave_native`
+  bracket a foreign call that may block. While `IN_NATIVE` a thread is
+  skipped by the driver's wait loop (it touches no managed heap, so the
+  collector runs *around* it) but its published roots are still forwarded.
+- **Conservative stack pins across mutators (MM-7).** With the
+  `conservative-pin` feature, each mutator publishes a stack window
+  (`set_stack_range`); the driver unions all active windows for one
+  `pin_pointers_in_ranges` pass, pinning pointer-shaped stack words so
+  stack-resident copies the collector can't rewrite stay valid.
+- **Explicit FFI pin/unpin (MM-0).** `Mutator::pin(w) -> PinHandle` /
+  `unpin` keep an object's address fixed across any number of cycles —
+  for addresses that have escaped into foreign code. Independent of the
+  `conservative-pin` feature.
 
-### What does not work
+**Poll-site contract (§4.2).** The `roots` slice passed to
+`poll_safepoint` / `enter_native` must be the mutator's *complete,
+consistent* live-root set at that point. A poll with a half-built root
+set lets the collector move an object the mutator still holds. The
+frontend owns this guarantee (precise stack maps, or `push_root`/`pop_root`).
 
-**Concurrent mutators without a lock.** The bump-pointer allocator (`AllocRegion`) is not atomic. Two threads writing to the same `AllocRegion` simultaneously will corrupt it. Do not share a heap across threads without a `Mutex` or equivalent.
+### Concurrent lock-free reads
 
-**Parallel GC.** The collection algorithms are single-threaded. There is no concurrent marking, no parallel evacuation, no work-stealing.
+`committed_pages()`, `page_count()`, `reserved_bytes()`, and `base_ptr()`
+use atomic loads and can be called from any thread without a lock,
+including while another thread holds the heap mutex or a collection runs.
 
-**Cooperative safepoint parking.** There is no `safepoint_poll()` API. The mutator cannot signal that it is safe to stop. GC cycles must be explicitly triggered — the caller is responsible for ensuring all mutators have stopped before calling any `collect_*` method.
+### Build configurations
 
-**Per-thread root enumeration from stack maps.** There is no integration with Rust's stack-unwinding ABI or LLVM's statepoint intrinsics. Roots must be enumerated manually by the caller in the `visit_roots` closure.
+- **Default** (`conservative-pin` on): both precise snapshot roots and
+  conservative stack-window pins are available.
+- **Precise-roots-only** (`--no-default-features`): the conservative scan
+  and the per-mutator stack-window machinery compile out entirely. Suited
+  to a statepoint-emitting frontend (e.g. OpenDylan) that supplies precise
+  roots. The full workspace test suite passes under both configurations.
 
-## Roadmap to concurrent mutators
+## What is still single-threaded
 
-The steps required, in order:
+**The collector itself.** Marking and evacuation run single-threaded on
+the driver's thread under stop-the-world. There is no concurrent marking,
+no parallel evacuation, and no work-stealing. The multi-mutator work made
+*allocation* and *root enumeration* concurrent and the *pause*
+cooperative; it did not parallelize the GC pause.
 
-1. **Per-thread TLABs (Thread-Local Allocation Buffers).** Each thread owns a slab of cells from the central free-page pool. Allocation bumps the thread-local pointer without a lock. The central pool uses an atomic CAS or mutex only when the TLAB is exhausted.
+**Card-table writes** already use relaxed atomic stores, so concurrent
+mutator card-marks are safe with no extra coordination.
 
-2. **Safepoint / poll-word API.** Each mutator thread checks a shared `AtomicBool` (the safepoint flag) on back-edges, function entries, or allocation sites. When the flag is set, the thread parks on a `Condvar` and waits for the GC to complete.
+## Validation
 
-3. **Cooperative parking.** The GC thread sets the safepoint flag and waits until all mutator threads have parked. It then runs the collection, clears the flag, and wakes all threads.
+- A cooperative-safepoint suite (`tests/safepoint.rs`) covers the
+  driver/worker handshake, including the cross-cycle straggler and
+  lost-wakeup cases.
+- `tests/native_call.rs`, `tests/conservative_mt.rs` cover MM-6 / MM-7.
+- `tests/stress_mt.rs` is a torture test: N workers concurrently
+  allocate, poll, take native excursions, and pin/unpin across collections
+  while a driver runs minor + full cycles, asserting no corruption. Tune
+  with `NEWGC_STRESS_ITERS` (e.g. `NEWGC_STRESS_ITERS=500000 cargo test
+  --release -p newgc-core --test stress_mt`).
 
-4. **Per-thread root walking.** Each parked thread must enumerate its own roots (stack slots, registers saved to a `jmp_buf`-style structure) and pass them to the evacuator. This requires either precise stack maps (from the compiler) or conservative stack scanning (`pin_pointers_in_ranges` over the saved frame).
-
-5. **Card table atomicity under concurrent writes.** The card table already uses `AtomicU8::store(Relaxed)` — concurrent mutator card-marks are already safe. No change needed here.
-
-Until steps 1–4 are implemented, the correct model is: one mutator thread, or multiple threads using `Mutex<PageHeap>`.
-
-A detailed phased design for implementing concurrent mutators — including TLAB retirement, safepoint coordination, happens-before analysis, and the `coord_mutex` protocol — is in [MULTI_MUTATOR_DESIGN.md](MULTI_MUTATOR_DESIGN.md).
+The phased design — TLAB retirement, safepoint coordination,
+happens-before analysis, the `coord_mutex` protocol, and the native-call
+and conservative-pin conventions — is in
+[MULTI_MUTATOR_DESIGN.md](MULTI_MUTATOR_DESIGN.md); the sprint breakdown
+and shipped-state notes are in
+[MULTI_MUTATOR_SPRINTS.md](MULTI_MUTATOR_SPRINTS.md).
 
 ---
 
