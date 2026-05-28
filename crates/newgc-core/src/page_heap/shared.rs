@@ -19,12 +19,43 @@
 //! today, so the orderings (Acquire/Release on poison, Relaxed on the
 //! counter) are conservative-correct and future-proof for MM-3.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::heap_common::CardTable;
 
 use super::alloc::PageStartBits;
+
+/// Cooperative stop-the-world rendezvous (MM-4; design §4). A collection
+/// driver bumps `epoch` and flips `world_running` to 0; every other
+/// mutator notices at its next `poll_safepoint`, parks (publishing its
+/// roots + flushing its TLABs), advances its own `last_epoch` to the
+/// target, and blocks on `park_cv` until `world_running` is 1 again.
+/// There is **no global `parked_count`** — the driver waits on each
+/// mutator's own `last_epoch` (design B-1).
+pub struct Safepoint {
+    /// Bumped (under `coord_mutex`) to request a safepoint. A mutator
+    /// whose `last_epoch < epoch` owes a park.
+    pub(crate) epoch: AtomicU64,
+    /// 1 = world running; 0 = stopped, parked mutators must block.
+    pub(crate) world_running: AtomicU8,
+    /// Guards the condvar wait/notify; also the mutex the driver holds
+    /// while polling per-mutator `last_epoch`.
+    pub(crate) park_mutex: Mutex<()>,
+    /// Mutators wait here for resume; the driver waits here for arrivals.
+    pub(crate) park_cv: Condvar,
+}
+
+impl Safepoint {
+    fn new() -> Self {
+        Self {
+            epoch: AtomicU64::new(0),
+            world_running: AtomicU8::new(1),
+            park_mutex: Mutex::new(()),
+            park_cv: Condvar::new(),
+        }
+    }
+}
 
 /// Lock-free shared heap state. Cloned (via `Arc`) into `PageHeap` and,
 /// from MM-3 on, into every `Mutator`. Not generic over the layout —
@@ -44,6 +75,12 @@ pub struct SharedHeap {
     /// Soft card table over the whole reservation. Atomic interior;
     /// `mark_card_at` is a Relaxed byte store.
     pub(crate) cards: Arc<CardTable>,
+    /// Stop-the-world rendezvous (MM-4).
+    pub(crate) safepoint: Safepoint,
+    /// Serializes collection drivers and mutator registration, so only
+    /// one STW cycle runs at a time and a newcomer can't join mid-cycle
+    /// (design §2.2, §4.4).
+    pub(crate) coord_mutex: Mutex<()>,
 }
 
 impl SharedHeap {
@@ -54,6 +91,8 @@ impl SharedHeap {
             bytes_alloc_since_gc: AtomicUsize::new(0),
             start_bits,
             cards,
+            safepoint: Safepoint::new(),
+            coord_mutex: Mutex::new(()),
         }
     }
 }

@@ -19,8 +19,9 @@
 
 use std::marker::PhantomData;
 use std::ptr::NonNull;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use crate::traits::HeapLayout;
 use crate::word::Word;
@@ -111,12 +112,38 @@ impl MutatorId {
     }
 }
 
-/// Per-mutator metadata in the coordinator's registry. Minimal in MM-1
-/// (existence only). MM-3 adds TLAB cursors; MM-4 adds `last_epoch` /
-/// `is_active` / `state` for the safepoint protocol.
-#[derive(Default)]
+/// Per-mutator metadata in the registry, shared between the owning
+/// mutator and any collection driver. MM-4 adds the safepoint state;
+/// MM-5 adds the published root snapshot.
 struct MutatorInner {
-    // Intentionally empty in MM-1.
+    /// Last safepoint epoch this mutator has reached (parked at, or is
+    /// driving). The driver waits for `last_epoch >= target`. Mutator
+    /// stores Release; driver loads Acquire.
+    last_epoch: AtomicU64,
+    /// False once the mutator begins `Drop`. The driver drops an
+    /// inactive mutator from its wait set (design B-1).
+    is_active: AtomicBool,
+    /// True while this mutator is driving the current STW cycle; the
+    /// driver's wait loop skips itself (design B-2).
+    is_acting_coordinator: AtomicBool,
+    /// Root `Word`s the mutator published before reaching the safepoint.
+    /// The collector visits + updates these in place; the mutator copies
+    /// them back on resume (design §5). Never contended in practice (the
+    /// owner is parked when the driver reads it).
+    roots_snapshot: Mutex<Vec<Word>>,
+}
+
+impl MutatorInner {
+    fn new(current_epoch: u64) -> Self {
+        Self {
+            // A newcomer is "already at" the current epoch, so it isn't
+            // waited on for a cycle it never participated in (design A-1).
+            last_epoch: AtomicU64::new(current_epoch),
+            is_active: AtomicBool::new(true),
+            is_acting_coordinator: AtomicBool::new(false),
+            roots_snapshot: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 /// Shared mutator registry. A free slot is reused before the vector
@@ -132,10 +159,9 @@ impl Registry {
         }
     }
 
-    fn register(&self) -> (MutatorId, Arc<MutatorInner>) {
-        let inner = Arc::new(MutatorInner::default());
+    fn register(&self, current_epoch: u64) -> (MutatorId, Arc<MutatorInner>) {
+        let inner = Arc::new(MutatorInner::new(current_epoch));
         let mut slots = self.slots.write().unwrap();
-        // Reuse the first free slot, else push.
         let id = match slots.iter().position(|s| s.is_none()) {
             Some(i) => {
                 slots[i] = Some(Arc::clone(&inner));
@@ -158,6 +184,18 @@ impl Registry {
 
     fn live_count(&self) -> usize {
         self.slots.read().unwrap().iter().filter(|s| s.is_some()).count()
+    }
+
+    /// Snapshot the currently-registered mutators' inner handles. The
+    /// driver iterates this to wait for arrivals and to gather roots.
+    fn snapshot(&self) -> Vec<Arc<MutatorInner>> {
+        self.slots
+            .read()
+            .unwrap()
+            .iter()
+            .flatten()
+            .cloned()
+            .collect()
     }
 }
 
@@ -200,14 +238,22 @@ impl<L: HeapLayout> GcCoordinator<L> {
 
     /// Register a mutator on the current thread. The returned
     /// [`Mutator`] is `!Send` — keep it on this thread. Any number of
-    /// threads may register concurrently.
+    /// threads may register concurrently; registration serializes with
+    /// an in-flight STW cycle via `coord_mutex` so a newcomer can't join
+    /// mid-collection and escape the world-stop (design A-1/B-3).
     pub fn register_mutator(&self) -> Mutator<L> {
-        let (id, inner) = self.registry.register();
-        // Cache the lock-free handles for the bump fast path (one heap
-        // lock, at registration only).
+        // Cache the lock-free handles (one heap lock, at registration).
         let (shared, base_addr) = {
             let h = self.heap.lock().unwrap();
             (h.shared_handle(), h.base_ptr() as usize)
+        };
+        // Serialize with STW; register at the current (quiescent) epoch.
+        // Scope the coord_mutex guard so it drops before `shared` moves
+        // into the Mutator below.
+        let (id, inner) = {
+            let _coord = shared.coord_mutex.lock().unwrap();
+            let current_epoch = shared.safepoint.epoch.load(Ordering::Acquire);
+            self.registry.register(current_epoch)
         };
         Mutator {
             heap: Arc::clone(&self.heap),
@@ -445,27 +491,24 @@ impl<L: HeapLayout> Mutator<L> {
         }
     }
 
-    /// Reconcile every TLAB's unused tail back into its page's
-    /// `words_used` and clear the TLABs (next alloc refills fresh).
-    /// **Must be called before a collection** while this mutator holds
-    /// live TLABs — the cursor would otherwise dangle if GC moved the
-    /// TLAB's page. MM-4's safepoint protocol calls this automatically;
-    /// in MM-3 a single-mutator client calls it explicitly before
-    /// `GcCoordinator::collect_*`.
+    /// Clear every TLAB so the next allocation refills fresh. **Must be
+    /// called before a collection** while this mutator holds live TLABs
+    /// — the cursor would otherwise dangle if GC moved the TLAB's page.
+    /// MM-4's safepoint protocol calls this automatically at park; a
+    /// single-mutator client can call it explicitly before a collect.
+    ///
+    /// It deliberately does **not** reconcile `words_used`. `words_used`
+    /// is a per-page high-water mark, and a page may carry TLAB slabs
+    /// from *several* mutators; subtracting each slab's unused tail would
+    /// collapse the watermark below a later slab's live objects, and the
+    /// evacuator's `[0, words_used)` scan would then miss them. Leaving
+    /// `words_used` at the carved watermark over-states live data by the
+    /// unused tails, which is harmless: those cells are zeroed with no
+    /// start bits, so the start-bit-driven walkers skip them, and the
+    /// next evacuation rebuilds an exact `words_used` on the dest pages.
     pub fn flush_tlabs(&mut self) {
-        let mut heap = self.heap.lock().unwrap();
         for gi in 0..3 {
             for ki in 0..2 {
-                let t = self.tlabs[gi][ki];
-                if t.start.is_null() {
-                    continue;
-                }
-                let used = (t.cursor as usize - t.start as usize) / 8;
-                let unused = (t.reserved_cells as usize).saturating_sub(used);
-                if unused > 0 {
-                    let d = heap.desc_mut(t.page_idx);
-                    d.words_used = d.words_used.saturating_sub(unused as u16);
-                }
                 self.tlabs[gi][ki] = Tlab::empty();
             }
         }
@@ -491,13 +534,236 @@ impl<L: HeapLayout> Mutator<L> {
     pub fn unpin(&mut self, handle: PinHandle) {
         self.heap.lock().unwrap().unpin(handle);
     }
+
+    // -- MM-4/MM-5: safepoint protocol -----------------------------------
+
+    #[inline]
+    fn inner(&self) -> &MutatorInner {
+        &self._inner
+    }
+
+    /// Cooperative safepoint poll (design §4.2/§4.3). Cheap on the fast
+    /// path: a single relaxed-vs-acquire epoch compare. If a collection
+    /// has been requested, this **parks** the mutator — publishing
+    /// `roots`, flushing its TLABs, and blocking until the world resumes
+    /// — then copies the (possibly forwarded) roots back into `roots`.
+    ///
+    /// **Poll-site contract (§4.2):** `roots` must be the mutator's
+    /// complete, consistent live-root set at this point — every live
+    /// in-flight `Word`. A poll with a half-built root set lets the
+    /// collector move an object the mutator still holds. The frontend
+    /// owns this guarantee.
+    pub fn poll_safepoint(&mut self, roots: &mut [Word]) {
+        let global = self.shared.safepoint.epoch.load(Ordering::Acquire);
+        if self.inner().last_epoch.load(Ordering::Relaxed) == global {
+            return; // fast path: no safepoint pending
+        }
+        self.park(global, roots);
+    }
+
+    /// Cold path: park at `target` epoch until the world resumes.
+    #[cold]
+    fn park(&mut self, target: u64, roots: &mut [Word]) {
+        // Publish roots + flush TLABs BEFORE announcing arrival, so the
+        // driver (which reads them after observing our last_epoch) sees
+        // consistent state. flush_tlabs reconciles + clears (the TLAB
+        // page may be evacuated by this cycle); next alloc refills.
+        *self.inner().roots_snapshot.lock().unwrap() = roots.to_vec();
+        self.flush_tlabs();
+
+        let sp = &self.shared.safepoint;
+        // Announce + block under park_mutex (mutate-under-lock + notify
+        // is the lost-wakeup-free condvar pattern).
+        //
+        // Straggler re-arm: a mutator that parked for epoch `cur` and is
+        // still blocked when the *next* cycle begins (the driver bumped the
+        // epoch and re-stopped the world before we observed the resume)
+        // would otherwise be frozen at `last_epoch == cur` forever — the
+        // new driver waits for `last_epoch >= new_target`, but we can only
+        // advance by returning to a poll we never reach. So whenever we
+        // observe the epoch has moved, re-publish `last_epoch` at the new
+        // target and re-announce. This is sound: we've run no mutator code
+        // since publishing our roots, and the prior cycle updated our
+        // snapshot in place, so re-exposing it to the new cycle is correct.
+        // The driver cannot skip a cycle past us (it blocks until we reach
+        // each target), so our roots are visited on every cycle.
+        let mut guard = sp.park_mutex.lock().unwrap();
+        let mut cur = target;
+        self.inner().last_epoch.store(cur, Ordering::Release);
+        sp.park_cv.notify_all();
+        loop {
+            let global = sp.epoch.load(Ordering::Acquire);
+            if global != cur {
+                cur = global;
+                self.inner().last_epoch.store(cur, Ordering::Release);
+                sp.park_cv.notify_all();
+                continue;
+            }
+            if sp.world_running.load(Ordering::Acquire) == 1 {
+                break;
+            }
+            guard = sp.park_cv.wait(guard).unwrap();
+        }
+        drop(guard);
+
+        // Resume: copy the collector-updated snapshot back into `roots`.
+        let snap = self.inner().roots_snapshot.lock().unwrap();
+        let n = roots.len().min(snap.len());
+        roots[..n].copy_from_slice(&snap[..n]);
+    }
+
+    /// Drive a **minor** collection from this mutator's thread (design
+    /// §2.5/§4.4). Self-parks (publishes `roots`, flushes TLABs, marks
+    /// itself acting-coordinator), requests the safepoint, waits for
+    /// every *other* active mutator to park, then collects with **all**
+    /// mutators' published roots (plus the `extra` closure) visited in
+    /// place, and resumes the world. `roots` is updated in place.
+    ///
+    /// Panics on mid-evac OOM (poisoning the heap) — same as
+    /// `PageHeap::collect_minor`; the world is always resumed first.
+    pub fn collect_minor<F>(&mut self, roots: &mut [Word], extra: F) -> CollectResult
+    where
+        F: FnMut(&mut PageEvacuator<'_, L>),
+    {
+        self.drive_collect(roots, |heap, visit| heap.collect_minor(visit), extra)
+    }
+
+    /// Drive a **full** collection from this mutator's thread.
+    pub fn collect_full<F>(&mut self, roots: &mut [Word], extra: F) -> FullCollectResult
+    where
+        F: FnMut(&mut PageEvacuator<'_, L>),
+    {
+        self.drive_collect(roots, |heap, visit| heap.collect_full(visit), extra)
+    }
+
+    /// Shared driver body for `collect_minor` / `collect_full`. `run`
+    /// invokes the chosen `PageHeap` collector with the combined root
+    /// visitor.
+    fn drive_collect<R, C, F>(
+        &mut self,
+        roots: &mut [Word],
+        run: C,
+        mut extra: F,
+    ) -> R
+    where
+        C: FnOnce(&mut PageHeap<L>, &mut dyn FnMut(&mut PageEvacuator<'_, L>)) -> R,
+        F: FnMut(&mut PageEvacuator<'_, L>),
+    {
+        // (a) Self-park: publish our own roots + flush our TLABs, and
+        //     mark ourselves the driver so the wait loop skips us.
+        *self.inner().roots_snapshot.lock().unwrap() = roots.to_vec();
+        self.flush_tlabs();
+        self.inner().is_acting_coordinator.store(true, Ordering::Release);
+
+        // Resume-the-world + clear-coordinator on every exit path
+        // (including an OOM unwind), so other mutators can't get stuck.
+        struct ResumeGuard {
+            shared: Arc<SharedHeap>,
+            inner: Arc<MutatorInner>,
+        }
+        impl Drop for ResumeGuard {
+            fn drop(&mut self) {
+                let sp = &self.shared.safepoint;
+                // Set world_running + notify UNDER park_mutex: parked
+                // mutators block in a plain `cv.wait` (no timeout), so the
+                // resume must be published while holding the mutex or a
+                // notify could be lost and a worker would hang forever.
+                {
+                    let _g = sp.park_mutex.lock().unwrap();
+                    sp.world_running.store(1, Ordering::Release);
+                    sp.park_cv.notify_all();
+                }
+                self.inner.is_acting_coordinator.store(false, Ordering::Release);
+            }
+        }
+
+        let result = {
+            // Serialize STW drivers + registration.
+            let _coord = self.shared.coord_mutex.lock().unwrap();
+            let sp = &self.shared.safepoint;
+            // Publish the stop (epoch bump + world_running = 0) UNDER
+            // park_mutex. A parked worker reads `epoch` then `world_running`
+            // in its park loop while holding park_mutex; performing both
+            // stores under the same lock prevents it from observing a torn
+            // (stale-epoch, fresh-stop) state and re-sleeping at the old
+            // epoch while we wait for it to reach the new target.
+            let target = {
+                let _g = sp.park_mutex.lock().unwrap();
+                let t = sp.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+                self.inner().last_epoch.store(t, Ordering::Release);
+                sp.world_running.store(0, Ordering::Release);
+                t
+            };
+
+            let _resume = ResumeGuard {
+                shared: Arc::clone(&self.shared),
+                inner: Arc::clone(&self._inner),
+            };
+
+            // (c) Wait for every other active, non-coordinator mutator
+            //     to reach `target`.
+            let others = self.registry.snapshot();
+            {
+                let mut guard = sp.park_mutex.lock().unwrap();
+                for m in &others {
+                    while m.is_active.load(Ordering::Acquire)
+                        && !m.is_acting_coordinator.load(Ordering::Acquire)
+                        && m.last_epoch.load(Ordering::Acquire) < target
+                    {
+                        guard = sp
+                            .park_cv
+                            .wait_timeout(guard, Duration::from_secs(10))
+                            .unwrap()
+                            .0;
+                    }
+                }
+            }
+
+            // (d) World stopped. Lock the heap and collect, visiting the
+            //     caller's extra roots plus every active mutator's
+            //     published snapshot (updated in place by the evacuator).
+            let mut heap = self.heap.lock().unwrap();
+            let r = run(&mut heap, &mut |evac| {
+                extra(evac);
+                for m in &others {
+                    if !m.is_active.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let mut snap = m.roots_snapshot.lock().unwrap();
+                    for w in snap.iter_mut() {
+                        evac.visit(w);
+                    }
+                }
+            });
+            drop(heap);
+            r
+            // _resume drops here: world resumes, coordinator flag cleared.
+            // _coord drops: next cycle/registration may proceed.
+        };
+
+        // Copy our own (updated) snapshot back into `roots`.
+        let snap = self.inner().roots_snapshot.lock().unwrap();
+        let n = roots.len().min(snap.len());
+        roots[..n].copy_from_slice(&snap[..n]);
+        result
+    }
 }
 
 impl<L: HeapLayout> Drop for Mutator<L> {
     fn drop(&mut self) {
-        // Deregister the slot. MM-1 touches no heap state on drop; the
-        // STW-aware drop (deregister + notify) lands with the safepoint
-        // protocol in MM-4.
+        // STW-aware drop (design §2.1 / B-1): mark inactive so a driver
+        // waiting on us drops us from its wait set, deregister the slot,
+        // and wake any waiting driver. We touch no heap state (TLAB tail
+        // is abandoned — harmless; the page carries no start bits there).
+        // Mark inactive + wake any waiting driver UNDER park_mutex, so a
+        // driver blocked on our (now-departing) slot can't miss the notify
+        // and stall on the 10 s timeout before re-checking is_active.
+        {
+            let sp = &self.shared.safepoint;
+            let _g = sp.park_mutex.lock().unwrap();
+            self.inner().is_active.store(false, Ordering::Release);
+            sp.park_cv.notify_all();
+        }
         self.registry.deregister(self.id);
     }
 }

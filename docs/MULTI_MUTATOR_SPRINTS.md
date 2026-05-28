@@ -145,7 +145,7 @@ no lock.
 
 ---
 
-## MM-4 — Safepoint protocol + cooperative parking  *(≈5 days; deps: MM-3)*
+## MM-4 — Safepoint protocol + cooperative parking  *(≈5 days; deps: MM-3)* — ✅ DONE
 
 **Design:** §4.1–4.5. **Goal:** the parking machinery — `Safepoint`
 (`epoch`, `world_running`, condvar), `Mutator::poll_safepoint`/`park`,
@@ -168,7 +168,7 @@ at most one other (parked) mutator; ordering audited (§4.4).
 
 ---
 
-## MM-5 — Per-mutator snapshot roots → sound multi-mutator GC  *(≈4 days; deps: MM-4)*
+## MM-5 — Per-mutator snapshot roots → sound multi-mutator GC  *(≈4 days; deps: MM-4)* — ✅ DONE
 
 **Design:** §5.1, §4.4, A-2. **Goal:** `roots_snapshot` per mutator,
 `publish_roots`, the coordinator gathers every active mutator's snapshot
@@ -187,6 +187,25 @@ sound.
   `notify_all`); cycle completes.
 
 **Done when:** N mutators can allocate while one drives GC, soundly.
+
+**Shipped (MM-4+MM-5, one commit):** `Safepoint { epoch, world_running,
+park_mutex, park_cv }`; `Mutator::poll_safepoint`/`park`;
+driver self-park via `drive_collect` (`collect_minor`/`collect_full`)
+with `is_acting_coordinator`; per-mutator `roots_snapshot` gathered +
+forwarded in place; per-mutator `last_epoch`/`is_active` wait;
+registration serialized with STW via `coord_mutex`; `ResumeGuard`
+resume-on-every-exit. Tests in `tests/safepoint.rs`:
+`driver_does_not_wait_on_itself` (B-2), `poll_safepoint_noop_when_no_gc`,
+`dropped_mutator_not_waited_on` (B-1), and
+`multi_worker_rooted_survival_under_concurrent_gc` (3 workers poll-loop
+while a driver runs 25+ cycles; every per-mutator root survives and is
+forwarded). **Concurrency fixes found here:** (1) `ResumeGuard` must
+resume under `park_mutex` (lost-wakeup); (2) a *straggler* parked for
+epoch `N` that the driver laps into `N+1` must **re-arm** `last_epoch` to
+the live epoch (else frozen → permanent deadlock); (3) the driver
+publishes the stop (epoch bump + `world_running=0`) under `park_mutex` to
+prevent a torn stale-epoch/fresh-stop read; (4) `flush_tlabs` must not
+reconcile per-page `words_used` (multi-TLAB-per-page high-water hazard).
 
 ---
 
