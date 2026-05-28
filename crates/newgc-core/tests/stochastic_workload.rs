@@ -1229,3 +1229,41 @@ fn stochastic_blended_long_session_seed_777() {
     // of accumulated promotion.
     run_blended(777, 512 * 64 * 1024, 15_000, 15);
 }
+
+// -------------------------------------------------------------------------
+// Resilience sweep — the tests above pin a handful of seeds; this runs
+// many *fresh* seeds through the blended workload (all shapes, minor +
+// major + 20 % collect_full, continuous per-cycle integrity sweep, and
+// the end-of-run collect_full drain assertion). It guards single-mutator
+// resilience against regressions from the multi-mutator refactor: each
+// seed is a distinct allocation-order / lifetime fingerprint, so a broad
+// pass is strong evidence the PageHeap path is still sound. The default
+// count keeps the normal suite fast; crank it for a deep run:
+//   NEWGC_STOCHASTIC_SWEEP_SEEDS=1000 cargo test --release \
+//     -p newgc-core --test stochastic_workload seed_sweep
+// -------------------------------------------------------------------------
+
+// Regression: a fresh sweep seed that crashed with STATUS_ACCESS_VIOLATION
+// in the single-mutator blended workload (found by the resilience sweep).
+#[test]
+fn repro_blended_seed_0x5eed0050() {
+    // Regression for the cascade dirty-card-scan reading a decommitted G0
+    // page (stale descriptor snapshot). Crashed with EXCEPTION_ACCESS_
+    // VIOLATION before the fix in `PageHeap::decommit_page`. Found by the
+    // resilience seed sweep below; localized with `newgc_core::crash`.
+    run_blended(0x5eed0050, 256 * 64 * 1024, 3_000, 20);
+}
+
+#[test]
+fn stochastic_blended_seed_sweep() {
+    let n: u64 = std::env::var("NEWGC_STOCHASTIC_SWEEP_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
+    for i in 0..n {
+        // Fresh fingerprints, distinct from the pinned seeds above.
+        let seed = 0x5EED_0000u64.wrapping_add(i);
+        run_blended(seed, 256 * 64 * 1024, 3_000, 20);
+    }
+    eprintln!("stochastic_blended_seed_sweep: {n} fresh seeds OK");
+}

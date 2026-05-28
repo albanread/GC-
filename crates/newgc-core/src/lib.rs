@@ -10,6 +10,7 @@
 //! GC engine can serve more than one language runtime without
 //! re-importing this code wholesale.
 
+pub mod crash;
 pub mod heap_common;
 pub mod lisp_layout;
 pub mod page_heap;

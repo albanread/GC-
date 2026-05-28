@@ -1066,6 +1066,25 @@ impl<L: HeapLayout> PageHeap<L> {
         let bit = 1u64 << (idx % 64);
         self.committed_bits[word_idx].fetch_and(!bit, Ordering::AcqRel);
         self.committed_count.fetch_sub(1, Ordering::AcqRel);
+
+        // A decommitted page is unmapped — reading it faults. Clear the
+        // reservation cards covering it so a later card scan *in the same
+        // cycle* never dereferences it. This closes a stale-snapshot
+        // hazard: `collect_minor`'s G1→Tenured cascade (and `collect_full`'s
+        // passes) scan dirty cards against a page-descriptor snapshot taken
+        // at cycle start, in which a G0 page that an earlier pass has since
+        // released + decommitted still appears live (non-Free, ≠ from_gen),
+        // so the filter would pass it and `visit_cell` would read freed,
+        // unmapped memory (EXCEPTION_ACCESS_VIOLATION). Any cross-gen
+        // pointers the page held are gone (its live objects were evacuated,
+        // or it was dead), and old-gen cards are rebuilt from the live heap
+        // at cycle end, so clearing here loses nothing.
+        let cards_per_page = PAGE_SIZE_CELLS / crate::heap_common::CARD_SIZE_CELLS;
+        let first_card = idx * cards_per_page;
+        let n_cards = self.shared.cards.n_cards();
+        for c in first_card..(first_card + cards_per_page).min(n_cards) {
+            self.shared.cards.clear(c);
+        }
         Ok(())
     }
 
