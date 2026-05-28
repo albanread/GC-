@@ -216,6 +216,83 @@ impl<L: HeapLayout> PageHeap<L> {
         Some(idx)
     }
 
+    /// MM-3: carve a TLAB slab from the `(generation, kind)` region for
+    /// a mutator's lock-free bump. Returns `(slab_start, page_idx,
+    /// slab_cells)`. The slab is contiguous within a single page (so a
+    /// cons can never straddle a page boundary), at least `min_cells`
+    /// and at most `want_cells` long. Pre-charges the page's
+    /// `words_used` by `slab_cells`; does **not** set start bits or bump
+    /// `bytes_alloc_since_gc` — the mutator does those per object during
+    /// its lock-free bump. Honors `young_page_cap` (bypassed during
+    /// GC-internal evacuation, like the small-object path).
+    pub(crate) fn reserve_tlab(
+        &mut self,
+        generation: Generation,
+        kind: PageKind,
+        min_cells: usize,
+        want_cells: usize,
+    ) -> Option<(NonNull<u64>, usize, usize)> {
+        if self.shared.poisoned.load(Ordering::Acquire) {
+            return None;
+        }
+        let min = min_cells.max(1);
+        let want = want_cells.clamp(min, PAGE_SIZE_CELLS);
+        // Carve from the current region page if it has room for at least
+        // `min` cells; otherwise acquire a fresh page.
+        let avail_now = {
+            let r = self.alloc_region(generation, kind);
+            if r.has_page() {
+                PAGE_SIZE_CELLS.saturating_sub(r.offset)
+            } else {
+                0
+            }
+        };
+        if avail_now >= min {
+            return self.carve_tlab_in_current(generation, kind, want);
+        }
+        // Need a fresh page. Same young-cap gate as `try_alloc_in_region`.
+        if generation == Generation::G0
+            && !self.recycle_live_counts_active_for(Generation::G0)
+            && self.count_pages_in_gen(Generation::G0) >= self.young_page_cap
+        {
+            return None;
+        }
+        let new_page = self.acquire_free_page(generation, kind)?;
+        let r = self.alloc_region_mut(generation, kind);
+        r.current_page = new_page;
+        r.offset = 0;
+        self.carve_tlab_in_current(generation, kind, want)
+    }
+
+    /// Carve up to `want` cells (capped at the current page's remaining
+    /// space) from the region's current page. Advances the region
+    /// offset and pre-charges `words_used`. Helper for `reserve_tlab`.
+    fn carve_tlab_in_current(
+        &mut self,
+        generation: Generation,
+        kind: PageKind,
+        want: usize,
+    ) -> Option<(NonNull<u64>, usize, usize)> {
+        let (page_idx, offset, avail) = {
+            let r = self.alloc_region(generation, kind);
+            if !r.has_page() {
+                return None;
+            }
+            (r.current_page, r.offset, PAGE_SIZE_CELLS.saturating_sub(r.offset))
+        };
+        if avail == 0 {
+            return None;
+        }
+        let slab = want.min(avail);
+        let ptr = unsafe { (self.page_ptr(page_idx) as *mut u64).add(offset) };
+        self.alloc_region_mut(generation, kind).offset += slab;
+        {
+            let d = self.desc_mut(page_idx);
+            d.words_used = d.words_used.saturating_add(slab as u16);
+        }
+        Some((unsafe { NonNull::new_unchecked(ptr) }, page_idx, slab))
+    }
+
     /// Allocate a cons cell (2 cells = 16 bytes) in the given
     /// generation. Returns a pointer to the first cell, or `None`
     /// if the heap is full.

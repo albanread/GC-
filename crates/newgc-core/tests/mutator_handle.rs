@@ -78,6 +78,10 @@ fn rooted_alloc_via_mutator_survives_collect() {
     }
     let mut root = [Word::from_ptr(p.as_ptr() as *const u8, Tag::Cons)];
 
+    // MM-3: the mutator holds a live TLAB; flush it before collecting so
+    // its cursor can't dangle if GC moves the TLAB's page. (MM-4's
+    // safepoint protocol will do this automatically.)
+    m.flush_tlabs();
     coord.collect_minor(|evac| evac.visit(&mut root[0]));
 
     let addr = (root[0].raw() & PAYLOAD_MASK) as *const u64;

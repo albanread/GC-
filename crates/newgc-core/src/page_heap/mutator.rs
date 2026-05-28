@@ -19,16 +19,84 @@
 
 use std::marker::PhantomData;
 use std::ptr::NonNull;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::traits::HeapLayout;
 use crate::word::Word;
 
+use super::alloc::{set_cons_start_bit_at, set_start_bit_at};
 use super::cycle::{CollectResult, FullCollectResult};
 use super::evac::{GcError, PageEvacuator};
-use super::page_desc::Generation;
+use super::page_desc::{Generation, PageKind};
 use super::pin::PinHandle;
-use super::space::PageHeap;
+use super::shared::SharedHeap;
+use super::space::{PageHeap, PAGE_SIZE_CELLS};
+
+/// Initial TLAB refill size in cells (4 KB). Doubles each refill up to
+/// `MAX_TLAB_CELLS`.
+const INITIAL_TLAB_CELLS: usize = 512;
+/// Max TLAB size in cells (one 64 KB page).
+const MAX_TLAB_CELLS: usize = PAGE_SIZE_CELLS;
+
+/// `(gen_idx, kind_idx)` into the per-mutator `tlabs` array. Mirrors
+/// `PageHeap::region_index` (kept local since that one is private).
+#[inline]
+fn region_index(generation: Generation, kind: PageKind) -> (usize, usize) {
+    let gi = match generation {
+        Generation::G0 => 0,
+        Generation::G1 => 1,
+        Generation::Tenured => 2,
+        Generation::Free => unreachable!("Free has no alloc region"),
+    };
+    let ki = match kind {
+        PageKind::Cons => 0,
+        PageKind::Boxed => 1,
+        _ => unreachable!("only Cons/Boxed have TLABs"),
+    };
+    (gi, ki)
+}
+
+/// A thread-local allocation buffer: a slab carved from the heap that
+/// the owning mutator bumps **lock-free**. One per `(gen, kind)`.
+/// `Copy` so the `[[Tlab; 2]; 3]` array initializes cheaply.
+#[derive(Copy, Clone)]
+struct Tlab {
+    /// First cell of the slab (null = empty, triggers refill).
+    start: *mut u64,
+    /// Next free cell. Bumped by the fast path.
+    cursor: *mut u64,
+    /// One past the last cell of the slab.
+    end: *mut u64,
+    /// Page this slab lives on (for `words_used` reconciliation).
+    page_idx: usize,
+    /// Cells reserved at refill (for reconciling the unused tail).
+    reserved_cells: u32,
+    /// Size to request at the next refill (dynamic 4 KB → 64 KB).
+    next_refill_cells: u32,
+}
+
+impl Tlab {
+    const fn empty() -> Self {
+        Self {
+            start: std::ptr::null_mut(),
+            cursor: std::ptr::null_mut(),
+            end: std::ptr::null_mut(),
+            page_idx: 0,
+            reserved_cells: 0,
+            next_refill_cells: INITIAL_TLAB_CELLS as u32,
+        }
+    }
+
+    #[inline]
+    fn room_cells(&self) -> usize {
+        if self.start.is_null() {
+            0
+        } else {
+            (self.end as usize - self.cursor as usize) / 8
+        }
+    }
+}
 
 /// Stable identifier for a registered mutator (index into the
 /// coordinator's registry). Used by later sprints (MM-4) to look up a
@@ -135,10 +203,20 @@ impl<L: HeapLayout> GcCoordinator<L> {
     /// threads may register concurrently.
     pub fn register_mutator(&self) -> Mutator<L> {
         let (id, inner) = self.registry.register();
+        // Cache the lock-free handles for the bump fast path (one heap
+        // lock, at registration only).
+        let (shared, base_addr) = {
+            let h = self.heap.lock().unwrap();
+            (h.shared_handle(), h.base_ptr() as usize)
+        };
         Mutator {
             heap: Arc::clone(&self.heap),
+            shared,
+            base_addr,
             registry: Arc::clone(&self.registry),
             id,
+            tlabs: [[Tlab::empty(); 2]; 3],
+            tlab_refills: 0,
             _inner: inner,
             _not_send: PhantomData,
         }
@@ -234,8 +312,18 @@ impl<L: HeapLayout> GcCoordinator<L> {
 /// mutex; MM-3 adds a lock-free TLAB fast path.
 pub struct Mutator<L: HeapLayout> {
     heap: Arc<Mutex<PageHeap<L>>>,
+    /// Lock-free shared state (start bits, poison flag, alloc counter).
+    /// The bump fast path touches only this — no heap lock (MM-3).
+    shared: Arc<SharedHeap>,
+    /// Reservation base address, cached for global-cell-index math.
+    base_addr: usize,
     registry: Arc<Registry>,
     id: MutatorId,
+    /// Per-`(gen, kind)` thread-local allocation buffers.
+    tlabs: [[Tlab; 2]; 3],
+    /// Count of TLAB refills (each takes the heap lock once). Diagnostic
+    /// — lets tests verify the bump fast path amortizes the lock.
+    tlab_refills: u64,
     _inner: Arc<MutatorInner>,
     _not_send: PhantomData<*mut ()>,
 }
@@ -246,28 +334,147 @@ impl<L: HeapLayout> Mutator<L> {
         self.id
     }
 
-    /// Allocate a cons cell in `generation`. Returns `None` on OOM or if
-    /// the heap is poisoned.
+    /// Allocate a cons cell (2 cells) in `generation`. Lock-free bump
+    /// in the common case; locks the heap only to refill an exhausted
+    /// TLAB. Returns `None` on OOM or if the heap is poisoned.
+    #[inline]
     pub fn try_alloc_cons_in(&mut self, generation: Generation) -> Option<NonNull<u64>> {
-        self.heap.lock().unwrap().try_alloc_cons_in(generation)
+        self.bump(generation, PageKind::Cons, 2, /*is_cons=*/ true)
     }
 
-    /// Allocate an `n_cells` boxed object (header + payload) in `generation`.
+    /// Allocate an `n_cells` boxed object (header + payload) in
+    /// `generation`. Lock-free bump; refill on exhaustion.
+    #[inline]
     pub fn try_alloc_boxed_in(
         &mut self,
         generation: Generation,
         n_cells: usize,
     ) -> Option<NonNull<u64>> {
-        self.heap.lock().unwrap().try_alloc_boxed_in(generation, n_cells)
+        if n_cells == 0 || n_cells > PAGE_SIZE_CELLS {
+            return None;
+        }
+        self.bump(generation, PageKind::Boxed, n_cells, /*is_cons=*/ false)
     }
 
-    /// Allocate a large (≥ one page) object in `generation`.
+    /// Allocate a large (≥ one page) object in `generation`. Large
+    /// objects bypass TLABs and go through the central path under the
+    /// heap lock.
     pub fn try_alloc_large(
         &mut self,
         n_cells: usize,
         generation: Generation,
     ) -> Option<NonNull<u64>> {
         self.heap.lock().unwrap().try_alloc_large(n_cells, generation)
+    }
+
+    /// The lock-free bump fast path. On a hit it advances the TLAB
+    /// cursor, sets the object's start bit (atomic `fetch_or`), bumps
+    /// the alloc counter (atomic), and returns — **no heap lock**. On a
+    /// miss it refills (one heap lock) and retries.
+    #[inline]
+    fn bump(
+        &mut self,
+        generation: Generation,
+        kind: PageKind,
+        n_cells: usize,
+        is_cons: bool,
+    ) -> Option<NonNull<u64>> {
+        // Poison check is lock-free (Acquire on the shared flag).
+        if self.shared.poisoned.load(Ordering::Acquire) {
+            return None;
+        }
+        let (gi, ki) = region_index(generation, kind);
+        loop {
+            // Fast path: room in the current TLAB.
+            if self.tlabs[gi][ki].room_cells() >= n_cells {
+                let ptr = self.tlabs[gi][ki].cursor;
+                self.tlabs[gi][ki].cursor = unsafe { ptr.add(n_cells) };
+                let cell_idx = (ptr as usize - self.base_addr) / 8;
+                if is_cons {
+                    set_cons_start_bit_at(&self.shared.start_bits, cell_idx);
+                } else {
+                    set_start_bit_at(&self.shared.start_bits, cell_idx);
+                }
+                self.shared
+                    .bytes_alloc_since_gc
+                    .fetch_add(n_cells * 8, Ordering::Relaxed);
+                return Some(unsafe { NonNull::new_unchecked(ptr) });
+            }
+            // Slow path: refill and retry. If refill fails (OOM / cap /
+            // poison), give up.
+            if !self.refill(generation, kind, gi, ki, n_cells) {
+                return None;
+            }
+        }
+    }
+
+    /// Refill the `(gi, ki)` TLAB with a fresh slab carved under the
+    /// heap lock. Grows the request 4 KB → 64 KB across successive
+    /// refills. Returns false on OOM / young-cap / poison.
+    #[cold]
+    fn refill(
+        &mut self,
+        generation: Generation,
+        kind: PageKind,
+        gi: usize,
+        ki: usize,
+        min_cells: usize,
+    ) -> bool {
+        let want = (self.tlabs[gi][ki].next_refill_cells as usize).max(min_cells);
+        let slab = {
+            let mut heap = self.heap.lock().unwrap();
+            heap.reserve_tlab(generation, kind, min_cells, want)
+        };
+        self.tlab_refills += 1;
+        match slab {
+            Some((ptr, page_idx, cells)) => {
+                let next = ((self.tlabs[gi][ki].next_refill_cells as usize) * 2)
+                    .min(MAX_TLAB_CELLS) as u32;
+                let start = ptr.as_ptr();
+                self.tlabs[gi][ki] = Tlab {
+                    start,
+                    cursor: start,
+                    end: unsafe { start.add(cells) },
+                    page_idx,
+                    reserved_cells: cells as u32,
+                    next_refill_cells: next,
+                };
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Reconcile every TLAB's unused tail back into its page's
+    /// `words_used` and clear the TLABs (next alloc refills fresh).
+    /// **Must be called before a collection** while this mutator holds
+    /// live TLABs — the cursor would otherwise dangle if GC moved the
+    /// TLAB's page. MM-4's safepoint protocol calls this automatically;
+    /// in MM-3 a single-mutator client calls it explicitly before
+    /// `GcCoordinator::collect_*`.
+    pub fn flush_tlabs(&mut self) {
+        let mut heap = self.heap.lock().unwrap();
+        for gi in 0..3 {
+            for ki in 0..2 {
+                let t = self.tlabs[gi][ki];
+                if t.start.is_null() {
+                    continue;
+                }
+                let used = (t.cursor as usize - t.start as usize) / 8;
+                let unused = (t.reserved_cells as usize).saturating_sub(used);
+                if unused > 0 {
+                    let d = heap.desc_mut(t.page_idx);
+                    d.words_used = d.words_used.saturating_sub(unused as u16);
+                }
+                self.tlabs[gi][ki] = Tlab::empty();
+            }
+        }
+    }
+
+    /// Number of TLAB refills this mutator has performed (each took the
+    /// heap lock once). Diagnostic / test hook.
+    pub fn tlab_refill_count(&self) -> u64 {
+        self.tlab_refills
     }
 
     /// Card barrier — mark the card covering `slot_addr`.

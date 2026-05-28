@@ -1175,6 +1175,13 @@ impl<L: HeapLayout> PageHeap<L> {
         Arc::clone(&self.shared.start_bits)
     }
 
+    /// Clone of the `Arc<SharedHeap>` for a mutator's lock-free fast
+    /// path (MM-3). The mutator caches this at registration and bumps /
+    /// sets start bits / checks poison through it without the heap lock.
+    pub fn shared_handle(&self) -> Arc<SharedHeap> {
+        Arc::clone(&self.shared)
+    }
+
     /// Internal access to the start-bit bitmap slice. Used by the
     /// allocator helpers in `alloc.rs`.
     pub(crate) fn start_bits_slice(&self) -> &[AtomicU64] {

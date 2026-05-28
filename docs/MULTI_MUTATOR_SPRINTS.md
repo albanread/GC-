@@ -121,7 +121,7 @@ holds `Arc<SharedHeap>` + `Arc<Mutex<PageHeap>>` — never a bare
 
 ---
 
-## MM-3 — Per-mutator TLABs (lock-free bump)  *(≈4 days; deps: MM-2)*
+## MM-3 — Per-mutator TLABs (lock-free bump)  *(≈4 days; deps: MM-2)* — ✅ DONE
 
 **Design:** §3. **Goal:** real per-`(gen,kind)` TLABs on `Mutator`;
 lock-free bump fast path touching only `SharedHeap` atomics; refill takes

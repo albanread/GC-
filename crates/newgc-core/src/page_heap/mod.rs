@@ -44,4 +44,5 @@ pub use evac::{EvacResult, PageEvacuator};
 pub use mutator::{GcCoordinator, Mutator, MutatorId};
 pub use page_desc::{Generation, PageDesc, PageKind};
 pub use pin::PinHandle;
+pub use shared::SharedHeap;
 pub use space::{PageHeap, PAGE_SIZE_BYTES, PAGE_SIZE_CELLS};
