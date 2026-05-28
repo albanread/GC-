@@ -209,7 +209,7 @@ reconcile per-page `words_used` (multi-TLAB-per-page high-water hazard).
 
 ---
 
-## MM-6 — Native-call `InNative` convention  *(≈3 days; deps: MM-5, MM-0)*
+## MM-6 — Native-call `InNative` convention  *(≈3 days; deps: MM-5, MM-0)* — ✅ DONE
 
 **Design:** §4.6. **Goal:** `state: AtomicU8` (InDylan/InNative),
 `enter_native`/`leave_native`, collector skips `InNative` in the wait
@@ -227,6 +227,25 @@ publish on native entry.
 
 **Done when:** a thread blocked in foreign code can't hold the collector
 hostage, and objects it passed out are safe (via MM-0 pin).
+
+**Shipped:** `MutatorInner.state: AtomicU8` (`IN_DYLAN`/`IN_NATIVE`);
+`Mutator::enter_native(&[Word])` (publishes roots + flushes TLABs, then
+announces `IN_NATIVE` under `park_mutex` + notify so a driver already
+waiting on us drops us immediately rather than stalling 10 s);
+`Mutator::leave_native(&mut [Word])` (blocks on `world_running` before
+flipping to `IN_DYLAN`, re-adopts the current epoch, copies forwarded
+roots back); the driver's §4.4 wait predicate skips `IN_NATIVE` while
+its root-visit loop still forwards the native thread's published
+snapshot. Tests in `tests/native_call.rs`:
+`driver_does_not_stall_on_native_thread` (skip + survival + a <5 s bound
+that a broken skip's 10 s timeout would blow),
+`enter_leave_native_without_gc_roundtrips_roots` (no-GC fast path +
+epoch resync → poll is a no-op), `ffi_object_pinned_across_native_call`
+(MM-0 pin keeps a passed-out object's address fixed across cycles during
+the call), `native_and_polling_workers_survive_concurrent_gc`
+(integration: `IN_NATIVE` skip composes with normal park/poll). Note:
+unwind-cleanup (§4.6 option a) needs no core machinery — cleanup code
+reaches safepoints via the ordinary poll path, already covered.
 
 ---
 

@@ -19,7 +19,7 @@
 
 use std::marker::PhantomData;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -112,9 +112,18 @@ impl MutatorId {
     }
 }
 
+/// Execution state for the native-call convention (design §4.6).
+/// `IN_DYLAN` = running managed code; cooperates with safepoints by
+/// polling. `IN_NATIVE` = blocked in foreign code that may run long; the
+/// driver's wait loop skips it (it touches no managed heap while native,
+/// so it is safe to collect *around* it instead of waiting on it).
+const IN_DYLAN: u8 = 0;
+const IN_NATIVE: u8 = 1;
+
 /// Per-mutator metadata in the registry, shared between the owning
 /// mutator and any collection driver. MM-4 adds the safepoint state;
-/// MM-5 adds the published root snapshot.
+/// MM-5 adds the published root snapshot; MM-6 adds the native-call
+/// execution state.
 struct MutatorInner {
     /// Last safepoint epoch this mutator has reached (parked at, or is
     /// driving). The driver waits for `last_epoch >= target`. Mutator
@@ -131,6 +140,12 @@ struct MutatorInner {
     /// them back on resume (design §5). Never contended in practice (the
     /// owner is parked when the driver reads it).
     roots_snapshot: Mutex<Vec<Word>>,
+    /// Native-call execution state (`IN_DYLAN` / `IN_NATIVE`, design
+    /// §4.6). A mutator blocked in foreign code publishes `IN_NATIVE` so
+    /// the driver's wait loop skips it instead of holding every GC hostage
+    /// until the 10 s timeout. Mutator stores Release (after publishing
+    /// roots + flushing TLABs); driver loads Acquire.
+    state: AtomicU8,
 }
 
 impl MutatorInner {
@@ -142,6 +157,7 @@ impl MutatorInner {
             is_active: AtomicBool::new(true),
             is_acting_coordinator: AtomicBool::new(false),
             roots_snapshot: Mutex::new(Vec::new()),
+            state: AtomicU8::new(IN_DYLAN),
         }
     }
 }
@@ -612,6 +628,73 @@ impl<L: HeapLayout> Mutator<L> {
         roots[..n].copy_from_slice(&snap[..n]);
     }
 
+    // -- MM-6: native-call boundary convention (design §4.6) -------------
+
+    /// Call immediately **before** a foreign call that may block or run
+    /// long (a message pump, blocking I/O, a lock, a GPU present). After
+    /// this returns the thread **must not touch the managed heap** until
+    /// [`leave_native`](Self::leave_native) returns.
+    ///
+    /// Publishes `roots` and flushes TLABs (so a concurrent collector can
+    /// move the objects this thread holds and update them in place), then
+    /// announces `IN_NATIVE` so a driver skips this thread instead of
+    /// waiting out the 10 s timeout. Does **not** advance `last_epoch`:
+    /// the wait predicate skips `IN_NATIVE` regardless of epoch, so the
+    /// thread stays "arrived" across any number of cycles while blocked.
+    ///
+    /// **Not** an FFI pin: an object whose address is *passed into* the
+    /// foreign call and dereferenced by it while we block is not protected
+    /// — the foreign code holds a raw copy the in-place root update can't
+    /// reach. Pin those explicitly with [`pin`](Self::pin) first (§5.4).
+    pub fn enter_native(&mut self, roots: &[Word]) {
+        // Publish roots + flush TLABs BEFORE the Release store of `state`,
+        // so a collector that observes `IN_NATIVE` sees consistent state.
+        *self.inner().roots_snapshot.lock().unwrap() = roots.to_vec();
+        self.flush_tlabs();
+
+        let sp = &self.shared.safepoint;
+        // Announce IN_NATIVE under park_mutex + notify. A driver already
+        // blocked waiting on us (it saw us IN_DYLAN with a stale epoch when
+        // it built its wait set) wakes, re-checks, and drops us from the
+        // wait set immediately — rather than stalling on the 10 s timeout,
+        // which is the very hostage situation §4.6 exists to prevent.
+        let _g = sp.park_mutex.lock().unwrap();
+        self.inner().state.store(IN_NATIVE, Ordering::Release);
+        sp.park_cv.notify_all();
+    }
+
+    /// Call immediately **after** the foreign call returns, before
+    /// touching the managed heap again. Updates `roots` in place with the
+    /// (possibly forwarded) values the collector wrote while we blocked.
+    ///
+    /// If a collection is in progress, blocks until the world resumes
+    /// *before* flipping back to `IN_DYLAN` — so a returning thread never
+    /// resumes heap access while the collector owns the heap (this mirrors
+    /// the tail of [`park`](Self::park)).
+    pub fn leave_native(&mut self, roots: &mut [Word]) {
+        let sp = &self.shared.safepoint;
+        {
+            let mut guard = sp.park_mutex.lock().unwrap();
+            while sp.world_running.load(Ordering::Acquire) == 0 {
+                guard = sp.park_cv.wait(guard).unwrap();
+            }
+            // Re-enter at the current epoch (we owed no poll while native;
+            // adopting the latest makes our next poll a fast no-op). Both
+            // stores under park_mutex so a driver's stop (also taken under
+            // the lock, §4.4) cannot interleave between them.
+            self.inner()
+                .last_epoch
+                .store(sp.epoch.load(Ordering::Acquire), Ordering::Release);
+            self.inner().state.store(IN_DYLAN, Ordering::Release);
+        }
+        // The snapshot now holds forwarded values; copy them back to the
+        // caller's slots (same as the resume tail of `park`). TLABs are
+        // empty (cleared at enter_native); the next alloc refills.
+        let snap = self.inner().roots_snapshot.lock().unwrap();
+        let n = roots.len().min(snap.len());
+        roots[..n].copy_from_slice(&snap[..n]);
+    }
+
     /// Drive a **minor** collection from this mutator's thread (design
     /// §2.5/§4.4). Self-parks (publishes `roots`, flushes TLABs, marks
     /// itself acting-coordinator), requests the safepoint, waits for
@@ -706,8 +789,13 @@ impl<L: HeapLayout> Mutator<L> {
             {
                 let mut guard = sp.park_mutex.lock().unwrap();
                 for m in &others {
+                    // Skip ourselves (B-2), the departed (B-1), and threads
+                    // blocked in foreign code (§4.6 — IN_NATIVE; they touch
+                    // no managed heap, so we collect around them rather than
+                    // wait). Their published snapshot is still visited below.
                     while m.is_active.load(Ordering::Acquire)
                         && !m.is_acting_coordinator.load(Ordering::Acquire)
+                        && m.state.load(Ordering::Acquire) != IN_NATIVE
                         && m.last_epoch.load(Ordering::Acquire) < target
                     {
                         guard = sp
