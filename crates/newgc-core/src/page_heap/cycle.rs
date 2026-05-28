@@ -150,7 +150,7 @@ impl<L: HeapLayout> PageHeap<L> {
         // pointer writes via `mark_card_at`; this scan finds the
         // resulting cross-gen pointers without needing the caller to
         // enumerate them as explicit roots.
-        let reservation_cards: Arc<CardTable> = Arc::clone(&self.cards);
+        let reservation_cards: Arc<CardTable> = Arc::clone(&self.shared.cards);
         let reservation_base: *mut u64 = self.base_ptr() as *mut u64;
         let reservation_cells: usize = self.reserved_bytes() / 8;
         let descs_at_scan_time: Vec<PageDesc> = self.descs().to_vec();
@@ -241,7 +241,7 @@ impl<L: HeapLayout> PageHeap<L> {
         // pass 2). The descs snapshot is taken once at the start
         // and reused so the filter targets pages that were in their
         // pre-collection generation.
-        let reservation_cards: Arc<CardTable> = Arc::clone(&self.cards);
+        let reservation_cards: Arc<CardTable> = Arc::clone(&self.shared.cards);
         let reservation_base: *mut u64 = self.base_ptr() as *mut u64;
         let reservation_cells: usize = self.reserved_bytes() / 8;
         let descs_at_scan_time: Vec<PageDesc> = self.descs().to_vec();
@@ -358,7 +358,7 @@ impl<L: HeapLayout> PageHeap<L> {
         // Pre-capture shared data so closures can hold owned values
         // without borrowing `self`. Same pattern as collect_minor /
         // collect_major.
-        let reservation_cards: Arc<CardTable> = Arc::clone(&self.cards);
+        let reservation_cards: Arc<CardTable> = Arc::clone(&self.shared.cards);
         let reservation_base: *mut u64 = self.base_ptr() as *mut u64;
         let reservation_cells: usize = self.reserved_bytes() / 8;
 

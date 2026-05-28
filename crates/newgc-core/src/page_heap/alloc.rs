@@ -266,7 +266,7 @@ impl<L: HeapLayout> PageHeap<L> {
         // Poisoned heaps refuse allocations — see PageHeap::is_poisoned.
         // We can't safely hand out cells when forwarding markers and a
         // partial pin set may still be in place.
-        if self.poisoned {
+        if self.shared.poisoned.load(Ordering::Acquire) {
             return None;
         }
         // Try the fast path — fits in the current region.
@@ -338,8 +338,9 @@ impl<L: HeapLayout> PageHeap<L> {
         // alloc counter. We bump even for GC-internal copies (this
         // path is shared); the per-cycle reset in `collect_*`
         // clears it before the trigger is consulted again.
-        self.bytes_alloc_since_gc =
-            self.bytes_alloc_since_gc.saturating_add(n_cells * 8);
+        self.shared
+            .bytes_alloc_since_gc
+            .fetch_add(n_cells * 8, Ordering::Relaxed);
         // SAFETY: pointer is within a freshly-committed page; the
         // caller initialises the cells via `*p.add(i) = ...`.
         Some(unsafe { NonNull::new_unchecked(ptr) })
@@ -362,7 +363,7 @@ impl<L: HeapLayout> PageHeap<L> {
         n_cells: usize,
         generation: Generation,
     ) -> Option<std::ptr::NonNull<u64>> {
-        if self.poisoned {
+        if self.shared.poisoned.load(Ordering::Acquire) {
             return None;
         }
         let n_pages = n_cells.div_ceil(PAGE_SIZE_CELLS);
@@ -424,8 +425,9 @@ impl<L: HeapLayout> PageHeap<L> {
         set_start_bit_at(self.start_bits_slice(), head_cell);
 
         // Charge allocation bytes to the GC trigger counter.
-        self.bytes_alloc_since_gc =
-            self.bytes_alloc_since_gc.saturating_add(n_cells * 8);
+        self.shared
+            .bytes_alloc_since_gc
+            .fetch_add(n_cells * 8, Ordering::Relaxed);
 
         let ptr = self.page_ptr(start_idx) as *mut u64;
         std::ptr::NonNull::new(ptr)

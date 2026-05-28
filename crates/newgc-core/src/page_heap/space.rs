@@ -62,6 +62,7 @@ use crate::traits::HeapLayout;
 
 use super::alloc::{AllocRegion, PageStartBits};
 use super::page_desc::{Generation, PageDesc, PageKind};
+use super::shared::SharedHeap;
 
 /// Size of a single page in bytes. 64 KB matches Windows'
 /// VirtualAlloc allocation granularity (the smallest size that
@@ -128,16 +129,13 @@ pub struct PageHeap<L: HeapLayout> {
     /// kinds across `G0`, `G1`, `Tenured` generations = 6
     /// regions; `Free` and `Large` get no region.
     alloc_regions: [[AllocRegion; 2]; 3],
-    /// Global start-bit bitmap covering the whole reservation.
-    /// Same encoding as `heap::Semispace::starts`: 2 bits per
-    /// cell, packed into `AtomicU64` words. Pair `01` = boxed
-    /// header start, `11` = cons start, `00` = not a start.
-    ///
-    /// 64 MB for the 2 GB default reservation (3% overhead).
-    /// Mutators can cache an `Arc<[AtomicU64]>` handle (same as
-    /// `StartBits` in `heap.rs`) and use the same atomic-OR fast
-    /// path for marking starts.
-    start_bits: PageStartBits,
+    /// Lock-free shared heap state (MM-2): start-bit bitmap, card table,
+    /// poison flag, and the alloc counter. Held behind an `Arc` so a
+    /// mutator can touch these without the heap lock (MM-3) and so the
+    /// collector's `&mut PageHeap` never aliases a mutator's reference.
+    /// `start_bits` / `cards` / `poisoned` / `bytes_alloc_since_gc` are
+    /// reached through `self.shared` + the existing accessors.
+    pub(super) shared: Arc<SharedHeap>,
     /// Mark bitmap covering the whole reservation. One bit per
     /// cell, packed 64 cells per `u64` word. Bit `c % 64` of
     /// word `c / 64` is set when cell `c` is the start of a
@@ -198,18 +196,8 @@ pub struct PageHeap<L: HeapLayout> {
     /// Ticks only on cycles that already promoted G0; reset on the
     /// cycle that cascades into G1 promotion.
     pub(super) g0_promotes_since_g1_promote: u32,
-    /// Soft card-marking table covering the WHOLE reservation
-    /// (page-heap doesn't split into young/old address ranges the
-    /// way the semispace does). One byte per `CARD_SIZE_BYTES`
-    /// = 512 bytes; ~4 MB for the 2 GB default reservation.
-    ///
-    /// Sub-phase 9: mutator-side stores into older-than-G0 objects
-    /// mark cards via `GcCoordinator::mark_card`. Minor GC scans
-    /// dirty cards in G1/Tenured pages for cross-gen pointers into
-    /// G0. The field exists from sub-phase 11a so the coordinator
-    /// can wire its barrier through here; full minor-GC integration
-    /// follows in sub-phase 11b.
-    pub(super) cards: Arc<CardTable>,
+    /// (MM-2: the soft card table moved into `shared`
+    /// (`SharedHeap::cards`); reached via `self.cards()` / `self.shared.cards`.)
     /// Most recent pin-scan result (n_objects, n_cells), surfaced
     /// to `(gc-stats)` via `last_pin_summary`. Updated by every
     /// `pin_pointers_in_ranges`; sub-phase 11b populates the
@@ -237,8 +225,8 @@ pub struct PageHeap<L: HeapLayout> {
     // so older heaps with more tenured data get longer cycles
     // between collections (the absolute allocation budget grows
     // with the live set, matching SBCL's GENCGC policy).
-    /// Bytes allocated by the mutator since the last collection.
-    pub(super) bytes_alloc_since_gc: usize,
+    /// (MM-2: `bytes_alloc_since_gc` moved into `shared` as `AtomicUsize`;
+    /// reached via `self.shared.bytes_alloc_since_gc`.)
     /// Threshold for `should_collect`. Updated by `collect_auto`.
     pub(super) auto_gc_trigger_bytes: usize,
     /// Minimum allocation budget between collections. Default 8 MB.
@@ -246,16 +234,8 @@ pub struct PageHeap<L: HeapLayout> {
     /// Tenured-fill threshold for `should_collect_major`. Basis
     /// points (`10000 = 100%`). Default 7500 = 75% of reservation.
     pub(super) tenured_full_threshold_bps: u32,
-    /// Set to `true` when a GC cycle was aborted by `GcStallError`
-    /// (mid-evacuation OOM). Once poisoned, the heap state is
-    /// indeterminate — forwarding markers may sit in half-copied
-    /// from-pages, the pin set may be partially populated, card
-    /// bookkeeping may be out of sync. Subsequent `try_collect_*`
-    /// calls short-circuit to `Err` without attempting another
-    /// cycle (a second mid-state collect would compound corruption
-    /// rather than recover); allocation requests refuse rather than
-    /// hand out cells on a tainted heap. Only `Drop` is safe.
-    pub(super) poisoned: bool,
+    // (MM-2: the `poisoned` flag moved into `shared` as `AtomicBool`;
+    // reached via `self.is_poisoned()` and `self.shared.poisoned`.)
 }
 
 enum Backing {
@@ -415,6 +395,9 @@ impl<L: HeapLayout> PageHeap<L> {
         // card granularity as the semispace heap so the IR-level
         // barrier shape is identical.
         let cards = Arc::new(CardTable::new(total_bytes));
+        // MM-2: bundle the lock-free shared fields. Moved into one of
+        // the cfg-gated literals below (only one compiles per platform).
+        let shared = Arc::new(SharedHeap::new(start_bits, cards));
 
         #[cfg(windows)]
         {
@@ -441,7 +424,7 @@ impl<L: HeapLayout> PageHeap<L> {
                 commit_lock: Mutex::new(()),
                 descs,
                 alloc_regions,
-                start_bits,
+                shared,
                 mark_bits,
                 pinned_cells,
                 explicit_pins,
@@ -452,14 +435,11 @@ impl<L: HeapLayout> PageHeap<L> {
                 last_zero_live_pages_released: 0,
                 minors_since_g0_promote: 0,
                 g0_promotes_since_g1_promote: 0,
-                cards,
                 last_pin_summary: (0, 0),
                 young_page_cap: n_pages,
-                bytes_alloc_since_gc: 0,
                 auto_gc_trigger_bytes: 8 * 1024 * 1024,
                 gc_budget_min_bytes: 8 * 1024 * 1024,
                 tenured_full_threshold_bps: 7500,
-                poisoned: false,
             }
         }
         #[cfg(unix)]
@@ -498,7 +478,7 @@ impl<L: HeapLayout> PageHeap<L> {
                 commit_lock: Mutex::new(()),
                 descs,
                 alloc_regions,
-                start_bits,
+                shared,
                 mark_bits,
                 pinned_cells,
                 explicit_pins,
@@ -509,14 +489,11 @@ impl<L: HeapLayout> PageHeap<L> {
                 last_zero_live_pages_released: 0,
                 minors_since_g0_promote: 0,
                 g0_promotes_since_g1_promote: 0,
-                cards,
                 last_pin_summary: (0, 0),
                 young_page_cap: n_pages,
-                bytes_alloc_since_gc: 0,
                 auto_gc_trigger_bytes: 8 * 1024 * 1024,
                 gc_budget_min_bytes: 8 * 1024 * 1024,
                 tenured_full_threshold_bps: 7500,
-                poisoned: false,
             };
         }
         #[cfg(not(any(windows, unix)))]
@@ -541,7 +518,7 @@ impl<L: HeapLayout> PageHeap<L> {
                 commit_lock: Mutex::new(()),
                 descs,
                 alloc_regions,
-                start_bits,
+                shared,
                 mark_bits,
                 pinned_cells,
                 explicit_pins,
@@ -552,14 +529,11 @@ impl<L: HeapLayout> PageHeap<L> {
                 last_zero_live_pages_released: 0,
                 minors_since_g0_promote: 0,
                 g0_promotes_since_g1_promote: 0,
-                cards,
                 last_pin_summary: (0, 0),
                 young_page_cap: n_pages,
-                bytes_alloc_since_gc: 0,
                 auto_gc_trigger_bytes: 8 * 1024 * 1024,
                 gc_budget_min_bytes: 8 * 1024 * 1024,
                 tenured_full_threshold_bps: 7500,
-                poisoned: false,
             }
         }
     }
@@ -621,7 +595,7 @@ impl<L: HeapLayout> PageHeap<L> {
     /// Sub-phase 10 of `docs/GC_DESIGN.md`.
     #[inline]
     pub fn should_collect(&self) -> bool {
-        self.bytes_alloc_since_gc >= self.auto_gc_trigger_bytes
+        self.shared.bytes_alloc_since_gc.load(Ordering::Relaxed) >= self.auto_gc_trigger_bytes
     }
 
     /// Returns true when Tenured occupancy has exceeded the
@@ -668,7 +642,7 @@ impl<L: HeapLayout> PageHeap<L> {
         let budget = (tenured_used / 2).max(self.gc_budget_min_bytes);
         // Reset alloc counter; next trigger fires after `budget`
         // more bytes.
-        self.bytes_alloc_since_gc = 0;
+        self.shared.bytes_alloc_since_gc.store(0, Ordering::Relaxed);
         self.auto_gc_trigger_bytes = budget;
     }
 
@@ -684,7 +658,7 @@ impl<L: HeapLayout> PageHeap<L> {
 
     /// Bytes allocated since the last collection. Diagnostic.
     pub fn bytes_alloc_since_gc(&self) -> usize {
-        self.bytes_alloc_since_gc
+        self.shared.bytes_alloc_since_gc.load(Ordering::Relaxed)
     }
 
     /// Current auto-GC trigger threshold (bytes). Diagnostic.
@@ -754,7 +728,7 @@ impl<L: HeapLayout> PageHeap<L> {
             g1_used_bytes,
             tenured_used_bytes,
             total_used_bytes: g0_used_bytes + g1_used_bytes + tenured_used_bytes,
-            bytes_alloc_since_gc: self.bytes_alloc_since_gc,
+            bytes_alloc_since_gc: self.shared.bytes_alloc_since_gc.load(Ordering::Relaxed),
             auto_gc_trigger_bytes: self.auto_gc_trigger_bytes,
             gc_budget_min_bytes: self.gc_budget_min_bytes,
             tenured_full_threshold_bps: self.tenured_full_threshold_bps,
@@ -778,7 +752,7 @@ impl<L: HeapLayout> PageHeap<L> {
     /// The intended client response is to drop the heap and either
     /// abort the program or rebuild from durable state.
     pub fn is_poisoned(&self) -> bool {
-        self.poisoned
+        self.shared.poisoned.load(Ordering::Acquire)
     }
 
     /// `collect_minor` with mid-evacuation-OOM caught and returned
@@ -802,7 +776,7 @@ impl<L: HeapLayout> PageHeap<L> {
         }
         let result = run_catching_oom(|| self.collect_minor(visit_roots));
         if result.is_err() {
-            self.poisoned = true;
+            self.shared.poisoned.store(true, Ordering::Release);
         }
         result
     }
@@ -821,7 +795,7 @@ impl<L: HeapLayout> PageHeap<L> {
         }
         let result = run_catching_oom(|| self.collect_major(visit_roots));
         if result.is_err() {
-            self.poisoned = true;
+            self.shared.poisoned.store(true, Ordering::Release);
         }
         result
     }
@@ -840,7 +814,7 @@ impl<L: HeapLayout> PageHeap<L> {
         }
         let result = run_catching_oom(|| self.collect_auto(visit_roots));
         if result.is_err() {
-            self.poisoned = true;
+            self.shared.poisoned.store(true, Ordering::Release);
         }
         result
     }
@@ -848,7 +822,7 @@ impl<L: HeapLayout> PageHeap<L> {
     /// If poisoned, return `GcError::HeapPoisoned`. Used by
     /// `try_collect_*` to short-circuit before running another cycle.
     fn poisoned_err(&self) -> Option<super::evac::GcError> {
-        if self.poisoned {
+        if self.shared.poisoned.load(Ordering::Acquire) {
             Some(super::evac::GcError::HeapPoisoned)
         } else {
             None
@@ -865,7 +839,7 @@ impl<L: HeapLayout> PageHeap<L> {
         }
         let byte_offset = p - base;
         if byte_offset < self.reserved_bytes() {
-            self.cards.mark_offset(byte_offset);
+            self.shared.cards.mark_offset(byte_offset);
         }
     }
 
@@ -894,7 +868,7 @@ impl<L: HeapLayout> PageHeap<L> {
                 // and shouldn't track any pointer state.
                 let page_first_card = page_idx * cards_per_page;
                 for c in 0..cards_per_page {
-                    self.cards.clear(page_first_card + c);
+                    self.shared.cards.clear(page_first_card + c);
                 }
                 continue;
             }
@@ -926,10 +900,10 @@ impl<L: HeapLayout> PageHeap<L> {
                 let card_idx =
                     page_idx * cards_per_page + card_offset_in_page;
                 if has_heap_pointer {
-                    self.cards
+                    self.shared.cards
                         .mark_offset(card_first_cell * 8);
                 } else {
-                    self.cards.clear(card_idx);
+                    self.shared.cards.clear(card_idx);
                 }
             }
         }
@@ -1198,13 +1172,13 @@ impl<L: HeapLayout> PageHeap<L> {
     /// without taking the heap lock. The mutator caches one of
     /// these at registration.
     pub fn start_bits_handle(&self) -> PageStartBits {
-        Arc::clone(&self.start_bits)
+        Arc::clone(&self.shared.start_bits)
     }
 
     /// Internal access to the start-bit bitmap slice. Used by the
     /// allocator helpers in `alloc.rs`.
     pub(crate) fn start_bits_slice(&self) -> &[AtomicU64] {
-        &self.start_bits
+        &self.shared.start_bits
     }
 
     // -- Mark bitmap (sub-phase 5) ------------------------------------

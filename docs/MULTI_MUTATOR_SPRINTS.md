@@ -100,7 +100,7 @@ TLABs yet.
 
 ---
 
-## MM-2 — `SharedHeap` extraction (refactor)  *(≈2 days; deps: MM-0, MM-1)*
+## MM-2 — `SharedHeap` extraction (refactor)  *(≈2 days; deps: MM-0, MM-1)* — ✅ DONE
 
 **Design:** §2.0. **Goal:** pure refactor, **zero behavior change**. Move
 the lock-free-read fields into `Arc<SharedHeap>`: `poisoned: AtomicBool`,

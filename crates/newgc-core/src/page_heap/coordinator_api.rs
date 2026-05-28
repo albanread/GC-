@@ -28,6 +28,7 @@
 
 use crate::traits::HeapLayout;
 use std::ptr::NonNull;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::heap_common::{CardTable, StartBits, CARD_SIZE_CELLS};
@@ -153,7 +154,7 @@ impl<L: HeapLayout> PageHeap<L> {
     /// Reservation-wide card table accessor. Replaces the
     /// semispace-flavoured `old_cards`.
     pub fn cards(&self) -> &Arc<CardTable> {
-        &self.cards
+        &self.shared.cards
     }
 
     /// Card-table anchor base. Prefer `base_ptr() as *const u8`.
@@ -255,7 +256,7 @@ impl<L: HeapLayout> PageHeap<L> {
         // generation was the underlying page in at scan time? We
         // record the page indices in G1/Tenured up front so the
         // scanner inside the cycle can skip G0/Free cards.
-        let reservation_cards: Arc<CardTable> = Arc::clone(&self.cards);
+        let reservation_cards: Arc<CardTable> = Arc::clone(&self.shared.cards);
         let reservation_base: *mut u64 = self.base_ptr() as *mut u64;
         let reservation_cells: usize = self.reserved_bytes() / 8;
         let descs_at_scan_time: Vec<super::page_desc::PageDesc> =
@@ -303,7 +304,7 @@ impl<L: HeapLayout> PageHeap<L> {
         // leaving the static-area pointer dangling and the JIT
         // dereferencing freed memory (this is the
         // `demos/life.lisp` crash at minor-gcs=15).
-        clear_cards_unless_intergen::<L>(&self.cards, reservation_base, reservation_cells);
+        clear_cards_unless_intergen::<L>(&self.shared.cards, reservation_base, reservation_cells);
         clear_cards_unless_intergen::<L>(static_cards, static_base, static_cells);
     }
 
@@ -317,7 +318,7 @@ impl<L: HeapLayout> PageHeap<L> {
         static_cells: usize,
         visit_roots: &mut dyn FnMut(&mut MarkScanner<'_, '_, L>),
     ) {
-        let reservation_cards: Arc<CardTable> = Arc::clone(&self.cards);
+        let reservation_cards: Arc<CardTable> = Arc::clone(&self.shared.cards);
         let reservation_base: *mut u64 = self.base_ptr() as *mut u64;
         let reservation_cells: usize = self.reserved_bytes() / 8;
         let descs_at_scan_time: Vec<super::page_desc::PageDesc> =
@@ -517,8 +518,9 @@ impl<L: HeapLayout> PageHeap<L> {
         }
         // Sub-phase 10: trigger-policy bookkeeping (matches the
         // bump in `try_bump_in_current`).
-        self.bytes_alloc_since_gc =
-            self.bytes_alloc_since_gc.saturating_add(cells * 8);
+        self.shared
+            .bytes_alloc_since_gc
+            .fetch_add(cells * 8, Ordering::Relaxed);
         // SAFETY: pointer is within a freshly-committed G0 page.
         Some(unsafe { NonNull::new_unchecked(ptr) })
     }

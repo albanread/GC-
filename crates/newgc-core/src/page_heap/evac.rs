@@ -830,7 +830,7 @@ impl<L: HeapLayout> PageHeap<L> {
                 let dest_byte_end = dest_byte_offset + size * 8;
                 let mut byte = dest_byte_offset;
                 while byte < dest_byte_end {
-                    self.cards.mark_offset(byte);
+                    self.shared.cards.mark_offset(byte);
                     let next_card_start =
                         (byte / crate::heap_common::CARD_SIZE_BYTES + 1)
                             * crate::heap_common::CARD_SIZE_BYTES;

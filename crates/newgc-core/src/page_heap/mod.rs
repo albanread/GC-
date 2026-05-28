@@ -35,6 +35,7 @@ pub mod mutator;
 pub mod page_desc;
 pub mod pin;
 pub mod scanner;
+pub mod shared;
 pub mod space;
 
 pub use alloc::{AllocRegion, PageStartBits};
