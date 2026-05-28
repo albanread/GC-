@@ -30,5 +30,12 @@ features = [
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# MM-8: loom model checking of the safepoint handshake. Pulled in ONLY
+# under `--cfg loom`, so a normal `cargo build`/`cargo test` never resolves
+# or fetches it. Run the models with:
+#   RUSTFLAGS="--cfg loom" cargo test -p newgc-core --test loom_safepoint
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
 [lints]
 workspace = true
