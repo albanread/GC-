@@ -26,12 +26,42 @@
 //!   NEWGC_TORTURE_SEEDS=300 NEWGC_TORTURE_ITERS=800 \
 //!     cargo test --release -p newgc-core --test torture_mt -- --nocapture
 
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
+use std::time::Duration;
 
 use newgc_core::{
     GcCoordinator, Generation, HeapHeader, HeapType, LispLayout, PAYLOAD_MASK, Tag, Word,
 };
+
+// Per-worker phase breadcrumbs — set before each potentially-blocking
+// action so a watchdog can report what every worker is stuck doing if the
+// run wedges (the hang-equivalent of the SEH crash handler).
+const PH_INIT: u8 = 0;
+const PH_ALLOC: u8 = 1;
+const PH_POLL: u8 = 2;
+const PH_NATIVE: u8 = 3;
+const PH_PIN: u8 = 4;
+const PH_DRIVE_MINOR: u8 = 5;
+const PH_DRIVE_FULL: u8 = 6;
+const PH_CHECK: u8 = 7;
+const PH_DONE: u8 = 8;
+
+fn phase_name(p: u8) -> &'static str {
+    match p {
+        PH_INIT => "init",
+        PH_ALLOC => "alloc",
+        PH_POLL => "poll_safepoint",
+        PH_NATIVE => "enter/leave_native",
+        PH_PIN => "pin+poll+unpin",
+        PH_DRIVE_MINOR => "collect_minor (driving)",
+        PH_DRIVE_FULL => "collect_full (driving)",
+        PH_CHECK => "integrity check",
+        PH_DONE => "done",
+        _ => "?",
+    }
+}
 
 type Coord = GcCoordinator<LispLayout>;
 
@@ -106,12 +136,67 @@ fn payload(root: Word, shape: Shape) -> Option<i64> {
 
 fn run_torture(base_seed: u64, iters: usize) {
     let coord = Coord::with_reservation(512 * 64 * 1024);
+    // Cooperating workers park in microseconds; the 10 s default backstop
+    // would let a (bug-induced) stall masquerade as a multi-minute hang.
+    // Tighten it so the timeout is irrelevant to a correct run and a real
+    // deadlock surfaces as a clean watchdog abort, not an opaque wedge.
+    coord.set_safepoint_timeout(Duration::from_millis(200));
     let ready = Arc::new(Barrier::new(N_WORKERS));
+    let progress = Arc::new(AtomicU64::new(0));
+    let phases: Arc<Vec<AtomicU8>> =
+        Arc::new((0..N_WORKERS).map(|_| AtomicU8::new(PH_INIT)).collect());
+    let finished = Arc::new(AtomicBool::new(false));
+
+    // Watchdog: if the global progress counter freezes for ~6 s the run is
+    // wedged — dump each worker's phase and abort with a diagnosis (the
+    // hang-equivalent of the SEH crash report). With the 200 ms safepoint
+    // timeout, a mere stall keeps progress ticking, so this fires only on
+    // a true deadlock.
+    let watchdog = {
+        let progress = Arc::clone(&progress);
+        let phases = Arc::clone(&phases);
+        let finished = Arc::clone(&finished);
+        thread::spawn(move || {
+            let mut last = 0u64;
+            let mut stalls = 0u32;
+            while !finished.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(2000));
+                if finished.load(Ordering::Acquire) {
+                    break;
+                }
+                let now = progress.load(Ordering::Acquire);
+                if now == last {
+                    stalls += 1;
+                    if stalls >= 3 {
+                        eprintln!(
+                            "\n=== torture_mt WATCHDOG: no progress for ~6 s (seed base {base_seed:#x}) ==="
+                        );
+                        eprintln!("  global progress stuck at {now}");
+                        for w in 0..N_WORKERS {
+                            eprintln!(
+                                "  worker {w}: stuck in {}",
+                                phase_name(phases[w].load(Ordering::Acquire))
+                            );
+                        }
+                        eprintln!("  => likely a multi-mutator deadlock; phases show where each is wedged");
+                        use std::io::Write as _;
+                        let _ = std::io::stderr().flush();
+                        std::process::abort();
+                    }
+                } else {
+                    last = now;
+                    stalls = 0;
+                }
+            }
+        })
+    };
 
     let workers: Vec<_> = (0..N_WORKERS)
         .map(|w| {
             let c = coord.clone();
             let ready = Arc::clone(&ready);
+            let progress = Arc::clone(&progress);
+            let phases = Arc::clone(&phases);
             thread::spawn(move || {
                 let mut m = c.register_mutator();
                 let mut rng = Rng::new(base_seed ^ (w as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
@@ -142,7 +227,19 @@ fn run_torture(base_seed: u64, iters: usize) {
                 ready.wait();
 
                 for _ in 0..iters {
-                    match rng.range(100) {
+                    let op = rng.range(100);
+                    phases[w].store(
+                        match op {
+                            0..=34 => PH_ALLOC,
+                            35..=49 => PH_NATIVE,
+                            50..=61 => PH_PIN,
+                            62..=78 => PH_DRIVE_MINOR,
+                            79..=83 => PH_DRIVE_FULL,
+                            _ => PH_POLL,
+                        },
+                        Ordering::Relaxed,
+                    );
+                    match op {
                         // alloc-replace: drop the old object (garbage),
                         // root a fresh one with a new sentinel.
                         0..=34 => {
@@ -190,9 +287,13 @@ fn run_torture(base_seed: u64, iters: usize) {
                         }
                     }
                     // Always reach a safepoint + verify each iteration.
+                    phases[w].store(PH_POLL, Ordering::Relaxed);
                     m.poll_safepoint(&mut roots);
+                    phases[w].store(PH_CHECK, Ordering::Relaxed);
                     check(&roots, &shapes, &expect);
+                    progress.fetch_add(1, Ordering::Relaxed);
                 }
+                phases[w].store(PH_DONE, Ordering::Relaxed);
                 // Done: dropping `m` deregisters this mutator. A peer still
                 // driving a cycle drops us from its wait set via the
                 // STW-aware Drop (is_active = false + notify under
@@ -205,6 +306,8 @@ fn run_torture(base_seed: u64, iters: usize) {
     for h in workers {
         h.join().expect("worker panicked");
     }
+    finished.store(true, Ordering::Release);
+    watchdog.join().expect("watchdog panicked");
 }
 
 #[test]

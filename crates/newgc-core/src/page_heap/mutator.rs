@@ -806,9 +806,27 @@ impl<L: HeapLayout> Mutator<L> {
     {
         // (a) Self-park: publish our own roots + flush our TLABs, and
         //     mark ourselves the driver so the wait loop skips us.
+        //
+        // Announce `is_acting_coordinator` UNDER park_mutex + notify. This
+        // becoming-a-coordinator transition falsifies an *active* driver's
+        // wait predicate (`!is_acting_coordinator`): when several mutators
+        // drive concurrently, one holds `coord_mutex` and waits on the
+        // others, while a late driver sets this flag and blocks on
+        // `coord_mutex`. Without the notify, the waiting driver isn't woken
+        // to drop the late driver from its wait set and stalls until the
+        // timeout fires (per-handoff), which under sustained concurrent
+        // driving degrades to an apparent hang. This mirrors the
+        // mutate-under-lock + notify discipline of `park` / `enter_native`
+        // / `Drop`; publishing roots *before* the flag keeps a concurrent
+        // collector's in-place visit of our snapshot consistent.
         *self.inner().roots_snapshot.lock().unwrap() = roots.to_vec();
         self.flush_tlabs();
-        self.inner().is_acting_coordinator.store(true, Ordering::Release);
+        {
+            let sp = &self.shared.safepoint;
+            let _g = sp.park_mutex.lock().unwrap();
+            self.inner().is_acting_coordinator.store(true, Ordering::Release);
+            sp.park_cv.notify_all();
+        }
 
         // Resume-the-world + clear-coordinator on every exit path
         // (including an OOM unwind), so other mutators can't get stuck.
