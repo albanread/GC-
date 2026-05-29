@@ -47,6 +47,7 @@ const PH_DRIVE_MINOR: u8 = 5;
 const PH_DRIVE_FULL: u8 = 6;
 const PH_CHECK: u8 = 7;
 const PH_DONE: u8 = 8;
+const PH_MUTATE_LINK: u8 = 9;
 
 fn phase_name(p: u8) -> &'static str {
     match p {
@@ -59,6 +60,7 @@ fn phase_name(p: u8) -> &'static str {
         PH_DRIVE_FULL => "collect_full (driving)",
         PH_CHECK => "integrity check",
         PH_DONE => "done",
+        PH_MUTATE_LINK => "rewrite link + mark_card",
         _ => "?",
     }
 }
@@ -96,11 +98,10 @@ impl Rng {
 enum Shape {
     Cons,
     Boxed,
-}
-
-/// Distinct, fixnum-safe sentinel for worker `w`, slot `s`, version `v`.
-fn sentinel(w: usize, s: usize, v: u64) -> i64 {
-    (((w as i64) & 0xff) << 40) | (((s as i64) & 0xff) << 32) | (v as i64 & 0xffff_ffff)
+    /// A boxed container whose payload[1] points at a child cons. The
+    /// worker periodically rewrites that pointer + marks the card — the
+    /// concurrent cross-gen write-barrier path.
+    Linked,
 }
 
 fn alloc_cons(m: &mut newgc_core::Mutator<LispLayout>, car: i64) -> Option<Word> {
@@ -123,15 +124,45 @@ fn alloc_boxed(m: &mut newgc_core::Mutator<LispLayout>, sent: i64) -> Option<Wor
     Some(Word::from_ptr(p.as_ptr() as *const u8, Tag::Vector))
 }
 
+/// Allocate a linked container: a boxed object whose payload[0] is
+/// `container_sent` and whose payload[1] points at a fresh child cons
+/// carrying `child_sent`. Marks the card on the pointer slot (the
+/// cross-gen edge), exactly as a frontend's write barrier would.
+fn alloc_linked(
+    m: &mut newgc_core::Mutator<LispLayout>,
+    container_sent: i64,
+    child_sent: i64,
+) -> Option<Word> {
+    let child = alloc_cons(m, child_sent)?;
+    let p = m.try_alloc_boxed_in(Generation::G0, 3)?;
+    unsafe {
+        *p.as_ptr() = HeapHeader::new(HeapType::Vector, 2).raw();
+        *p.as_ptr().add(1) = Word::fixnum(container_sent).raw();
+        *p.as_ptr().add(2) = child.raw();
+        m.mark_card_at(p.as_ptr().add(2) as *const u8);
+    }
+    Some(Word::from_ptr(p.as_ptr() as *const u8, Tag::Vector))
+}
+
 /// Read the integrity payload of a rooted object at its (possibly
-/// forwarded) address: cons -> car; boxed -> payload[0].
+/// forwarded) address: cons -> car; boxed/linked container -> payload[0].
 fn payload(root: Word, shape: Shape) -> Option<i64> {
     let base = (root.raw() & PAYLOAD_MASK) as *const u64;
     let cell = match shape {
-        Shape::Cons => base,                  // car at cell 0
-        Shape::Boxed => unsafe { base.add(1) }, // payload[0] after header
+        Shape::Cons => base,                              // car at cell 0
+        Shape::Boxed | Shape::Linked => unsafe { base.add(1) }, // payload[0]
     };
     unsafe { Word::from_raw(*cell).as_fixnum() }
+}
+
+/// Follow a linked container's payload[1] to its child cons and read the
+/// child's car. The collector must have updated payload[1] in place when
+/// it moved the child, so this resolves to the live child after any GC.
+fn linked_child_car(container: Word) -> Option<i64> {
+    let base = (container.raw() & PAYLOAD_MASK) as *const u64;
+    let child = Word::from_raw(unsafe { *base.add(2) });
+    let cbase = (child.raw() & PAYLOAD_MASK) as *const u64;
+    unsafe { Word::from_raw(*cbase).as_fixnum() }
 }
 
 fn run_torture(base_seed: u64, iters: usize) {
@@ -204,23 +235,34 @@ fn run_torture(base_seed: u64, iters: usize) {
                 let mut roots = [Word::NIL; ROOTS_PER_WORKER];
                 let mut shapes = [Shape::Cons; ROOTS_PER_WORKER];
                 let mut expect = [0i64; ROOTS_PER_WORKER];
-                let mut version = [0u64; ROOTS_PER_WORKER];
+                let mut expect_child = [0i64; ROOTS_PER_WORKER];
+                // Monotonic, per-worker-unique sentinel source (high bits =
+                // worker id), so no two live values ever collide and a swap
+                // can't be masked.
+                let mut next_sent: i64 = (w as i64) << 44;
                 for s in 0..ROOTS_PER_WORKER {
-                    version[s] += 1;
-                    let sent = sentinel(w, s, version[s]);
-                    roots[s] = alloc_cons(&mut m, sent).expect("startup alloc");
+                    next_sent += 1;
+                    roots[s] = alloc_cons(&mut m, next_sent).expect("startup alloc");
                     shapes[s] = Shape::Cons;
-                    expect[s] = sent;
+                    expect[s] = next_sent;
                 }
                 let check = |roots: &[Word; ROOTS_PER_WORKER],
                              shapes: &[Shape; ROOTS_PER_WORKER],
-                             expect: &[i64; ROOTS_PER_WORKER]| {
+                             expect: &[i64; ROOTS_PER_WORKER],
+                             expect_child: &[i64; ROOTS_PER_WORKER]| {
                     for s in 0..ROOTS_PER_WORKER {
                         assert_eq!(
                             payload(roots[s], shapes[s]),
                             Some(expect[s]),
-                            "worker {w} slot {s} corrupted across GC"
+                            "worker {w} slot {s} (primary) corrupted across GC"
                         );
+                        if shapes[s] == Shape::Linked {
+                            assert_eq!(
+                                linked_child_car(roots[s]),
+                                Some(expect_child[s]),
+                                "worker {w} slot {s} linked child lost/corrupted across GC"
+                            );
+                        }
                     }
                 };
 
@@ -230,55 +272,94 @@ fn run_torture(base_seed: u64, iters: usize) {
                     let op = rng.range(100);
                     phases[w].store(
                         match op {
-                            0..=34 => PH_ALLOC,
-                            35..=49 => PH_NATIVE,
-                            50..=61 => PH_PIN,
-                            62..=78 => PH_DRIVE_MINOR,
-                            79..=83 => PH_DRIVE_FULL,
+                            0..=29 => PH_ALLOC,
+                            30..=42 => PH_MUTATE_LINK,
+                            43..=55 => PH_NATIVE,
+                            56..=66 => PH_PIN,
+                            67..=81 => PH_DRIVE_MINOR,
+                            82..=86 => PH_DRIVE_FULL,
                             _ => PH_POLL,
                         },
                         Ordering::Relaxed,
                     );
                     match op {
-                        // alloc-replace: drop the old object (garbage),
-                        // root a fresh one with a new sentinel.
-                        0..=34 => {
+                        // alloc-replace: drop the old object (garbage), root
+                        // a fresh cons / boxed / linked structure.
+                        0..=29 => {
                             let s = rng.range(ROOTS_PER_WORKER);
-                            version[s] += 1;
-                            let sent = sentinel(w, s, version[s]);
-                            let boxed = rng.pct(40);
-                            let new = if boxed {
-                                alloc_boxed(&mut m, sent)
-                            } else {
-                                alloc_cons(&mut m, sent)
-                            };
-                            if let Some(word) = new {
-                                roots[s] = word;
-                                shapes[s] = if boxed { Shape::Boxed } else { Shape::Cons };
-                                expect[s] = sent;
-                            } else {
-                                version[s] -= 1; // alloc missed; keep old slot
+                            match rng.range(3) {
+                                0 => {
+                                    next_sent += 1;
+                                    if let Some(word) = alloc_cons(&mut m, next_sent) {
+                                        roots[s] = word;
+                                        shapes[s] = Shape::Cons;
+                                        expect[s] = next_sent;
+                                    }
+                                }
+                                1 => {
+                                    next_sent += 1;
+                                    if let Some(word) = alloc_boxed(&mut m, next_sent) {
+                                        roots[s] = word;
+                                        shapes[s] = Shape::Boxed;
+                                        expect[s] = next_sent;
+                                    }
+                                }
+                                _ => {
+                                    next_sent += 1;
+                                    let cont = next_sent;
+                                    next_sent += 1;
+                                    let child = next_sent;
+                                    if let Some(word) = alloc_linked(&mut m, cont, child) {
+                                        roots[s] = word;
+                                        shapes[s] = Shape::Linked;
+                                        expect[s] = cont;
+                                        expect_child[s] = child;
+                                    }
+                                }
+                            }
+                        }
+                        // rewrite a linked slot's child pointer + mark its
+                        // card: the concurrent cross-gen write-barrier path
+                        // (one mutator dirties a card while another may be
+                        // driving a cascade that scans it).
+                        30..=42 => {
+                            let s = rng.range(ROOTS_PER_WORKER);
+                            if shapes[s] == Shape::Linked {
+                                next_sent += 1;
+                                let child = next_sent;
+                                if let Some(cw) = alloc_cons(&mut m, child) {
+                                    // roots[s] is the container's current
+                                    // address (refreshed at the last poll;
+                                    // no GC has moved it since — a peer
+                                    // driver waits for us to park).
+                                    let base = (roots[s].raw() & PAYLOAD_MASK) as *mut u64;
+                                    unsafe {
+                                        *base.add(2) = cw.raw();
+                                        m.mark_card_at(base.add(2) as *const u8);
+                                    }
+                                    expect_child[s] = child;
+                                }
                             }
                         }
                         // native excursion: publish roots, "block", return.
-                        35..=49 => {
+                        43..=55 => {
                             m.enter_native(&roots);
                             std::hint::spin_loop();
                             m.leave_native(&mut roots);
                         }
                         // pin a root across a safepoint, then release it.
-                        50..=61 => {
+                        56..=66 => {
                             let s = rng.range(ROOTS_PER_WORKER);
                             let h = m.pin(roots[s]);
                             m.poll_safepoint(&mut roots);
                             m.unpin(h);
                         }
                         // drive a minor collection ourselves.
-                        62..=78 => {
+                        67..=81 => {
                             m.collect_minor(&mut roots, |_| {});
                         }
                         // drive a full collection ourselves.
-                        79..=83 => {
+                        82..=86 => {
                             m.collect_full(&mut roots, |_| {});
                         }
                         // poll (the common case).
@@ -290,7 +371,7 @@ fn run_torture(base_seed: u64, iters: usize) {
                     phases[w].store(PH_POLL, Ordering::Relaxed);
                     m.poll_safepoint(&mut roots);
                     phases[w].store(PH_CHECK, Ordering::Relaxed);
-                    check(&roots, &shapes, &expect);
+                    check(&roots, &shapes, &expect, &expect_child);
                     progress.fetch_add(1, Ordering::Relaxed);
                 }
                 phases[w].store(PH_DONE, Ordering::Relaxed);
