@@ -1329,6 +1329,32 @@ impl<L: HeapLayout> PageHeap<L> {
                 // can't mistake for a pointer.
                 zero_page_outside_ranges(self, page_idx, &pinned_ranges);
 
+                // The flip PROMOTES these pinned objects IN PLACE to
+                // `dest_gen`. Phase 1 cards every *copied* object's dest
+                // page (above) so a later minor's cross-gen card scan
+                // finds the pointers it carries into a younger generation;
+                // a flip must do the same, or the remembered set is
+                // incomplete for in-place-promoted objects. Concretely: a
+                // pinned cons promoted G0→G1→Tenured by successive flips
+                // keeps a `cdr` into a still-younger node; without carding
+                // it here, a future minor never scans this object, never
+                // treats that pointer as a root, and reclaims the younger
+                // target — leaving the `cdr` dangling (the cons-elision /
+                // interior-node-splice bug). Mirror Phase 1's per-object
+                // byte-range card marking.
+                for &(pinned_cell, size) in &pinned_ranges {
+                    let byte_offset = pinned_cell * 8;
+                    let byte_end = byte_offset + size * 8;
+                    let mut byte = byte_offset;
+                    while byte < byte_end {
+                        self.shared.cards.mark_offset(byte);
+                        let next_card_start =
+                            (byte / crate::heap_common::CARD_SIZE_BYTES + 1)
+                                * crate::heap_common::CARD_SIZE_BYTES;
+                        byte = next_card_start;
+                    }
+                }
+
                 flipped += 1;
             } else {
                 // RELEASE. The page goes to Free; its bytes are
