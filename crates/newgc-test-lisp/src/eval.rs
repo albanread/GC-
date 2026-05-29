@@ -19,7 +19,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use newgc_core::page_heap::evac::PageEvacuator;
-use newgc_core::{Generation, HeapLayout, LispLayout, Word};
+use newgc_core::page_heap::space::PageHeap;
+use newgc_core::{Generation, HeapLayout, LispLayout, Mutator, Word};
 
 use crate::reader::Sexp;
 use crate::value::{self, Heap, Value};
@@ -71,8 +72,16 @@ pub struct Interpreter {
     /// to a non-zero default so runs without explicit
     /// `(random-seed! n)` are still reproducible.
     rng_state: u64,
+    /// Shared (multi-mutator) mode only: counts safepoint polls; every
+    /// `SHARED_DRIVE_EVERY` the interpreter drives a minor collection
+    /// itself, since there is no auto-trigger behind a `Mutator`.
+    gc_drive_counter: usize,
     pub stats: Stats,
 }
+
+/// In `Heap::Shared` (multi-mutator) mode, drive a minor collection every
+/// this-many safepoint polls.
+const SHARED_DRIVE_EVERY: usize = 48;
 
 #[derive(Copy, Clone, Debug)]
 enum GcKind {
@@ -94,16 +103,34 @@ pub struct Stats {
 
 impl Interpreter {
     pub fn new(reservation_bytes: usize) -> Self {
-        let mut i = Interpreter {
-            heap: Heap::with_reservation(reservation_bytes),
+        Interpreter {
+            heap: Heap::Direct(PageHeap::with_reservation(reservation_bytes)),
             globals: HashMap::new(),
             functions: HashMap::new(),
             frames: Vec::new(),
             value_stack: Vec::new(),
             rng_state: 0xc0ffee_u64,
+            gc_drive_counter: 0,
             stats: Stats::default(),
-        };
-        i
+        }
+    }
+
+    /// Build an interpreter that allocates from a `Mutator` handle on a
+    /// shared `GcCoordinator` heap — the multi-mutator ("multi-nano-lisp")
+    /// mode. N of these run on separate threads concurrently; each
+    /// cooperates at safepoints and periodically drives a collection that
+    /// stops every interpreter and forwards all of their roots.
+    pub fn from_mutator(m: Mutator<LispLayout>) -> Self {
+        Interpreter {
+            heap: Heap::Shared(m),
+            globals: HashMap::new(),
+            functions: HashMap::new(),
+            frames: Vec::new(),
+            value_stack: Vec::new(),
+            rng_state: 0xc0ffee_u64,
+            gc_drive_counter: 0,
+            stats: Stats::default(),
+        }
     }
 
     /// Override the auto-GC threshold. Forwards to the heap's
@@ -989,13 +1016,32 @@ impl Interpreter {
     // -- GC integration ---------------------------------------------------
 
     fn maybe_gc(&mut self) {
-        // Sub-phase 10: defer the trigger decision to the GC. It
-        // tracks bytes-allocated and the auto-trigger threshold,
-        // and `collect_auto` will pick minor vs major based on
-        // Tenured pressure.
-        if self.heap.should_collect() {
+        if matches!(self.heap, Heap::Shared(_)) {
+            // Multi-mutator: always cooperate (publish roots + park if a
+            // peer is collecting), and drive a minor ourselves every so
+            // often, since there is no auto-trigger behind a `Mutator`.
+            self.poll_shared();
+            self.gc_drive_counter += 1;
+            if self.gc_drive_counter >= SHARED_DRIVE_EVERY {
+                self.gc_drive_counter = 0;
+                self.do_collect(GcKind::Minor);
+            }
+        } else if self.heap.should_collect() {
+            // Single-mutator: defer the trigger decision to the heap;
+            // `collect_auto` picks minor vs major from Tenured pressure.
             self.do_collect(GcKind::Auto);
         }
+    }
+
+    /// Multi-mutator safepoint: publish our roots and cooperate (park if a
+    /// peer is driving a collection), then write the forwarded values
+    /// back. No-op in `Direct` mode.
+    fn poll_shared(&mut self) {
+        let (mut roots, layout) = self.gather_roots();
+        if let Heap::Shared(m) = &mut self.heap {
+            m.poll_safepoint(&mut roots);
+        }
+        self.scatter_roots(&layout, &roots);
     }
 
     pub fn collect_minor(&mut self) {
@@ -1007,27 +1053,82 @@ impl Interpreter {
     }
 
     fn do_collect(&mut self, kind: GcKind) {
-        // Snapshot the layout of every Word slot. We can't pass
-        // pointers into self into the GC closure (self is borrowed
-        // mut by collect_minor); instead, gather Word references via
-        // an indexed scheme.
-        //
-        // Strategy: build a Vec<Word> by walking globals + frames +
-        // value_stack, run the GC closure on that Vec, then redistribute.
-        let mut roots: Vec<Word> = Vec::new();
-        let mut layout_idx: Vec<RootSlot> = Vec::new();
+        // Gather every live Word into a flat Vec (we can't hand pointers
+        // into `self` to the collector — `self` is borrowed), run the
+        // collection so it forwards them in place, then write them back.
+        let (mut roots, layout) = self.gather_roots();
+        let mut did_minor = 0usize;
+        let mut did_major = 0usize;
 
-        // value_stack
-        for (i, v) in self.value_stack.iter().enumerate() {
-            collect_value_words(v, &mut roots, &mut layout_idx, RootKind::ValueStack(i));
+        match &mut self.heap {
+            Heap::Direct(h) => match kind {
+                GcKind::Minor => {
+                    h.collect_minor(|evac: &mut PageEvacuator<'_, LispLayout>| {
+                        for r in roots.iter_mut() {
+                            evac.visit(r);
+                        }
+                    });
+                    h.recompute_auto_trigger();
+                    did_minor = 1;
+                }
+                GcKind::Major => {
+                    h.collect_major(|evac| {
+                        for r in roots.iter_mut() {
+                            evac.visit(r);
+                        }
+                    });
+                    h.recompute_auto_trigger();
+                    did_major = 1;
+                }
+                GcKind::Auto => {
+                    let picked_major = h.should_collect_major();
+                    let _ = h.collect_auto(|evac| {
+                        for r in roots.iter_mut() {
+                            evac.visit(r);
+                        }
+                    });
+                    if picked_major {
+                        did_major = 1;
+                    } else {
+                        did_minor = 1;
+                    }
+                }
+            },
+            Heap::Shared(m) => match kind {
+                // The driver self-parks, stops the world, and forwards
+                // these roots (plus every peer's published roots) in place.
+                GcKind::Major => {
+                    m.collect_full(&mut roots, |_| {});
+                    did_major = 1;
+                }
+                _ => {
+                    m.collect_minor(&mut roots, |_| {});
+                    did_minor = 1;
+                }
+            },
         }
-        // frames
+
+        self.stats.minor_gcs += did_minor;
+        self.stats.major_gcs += did_major;
+        self.scatter_roots(&layout, &roots);
+    }
+
+    /// Gather every live `Word` slot (value_stack + frames + globals) into
+    /// a flat `Vec<Word>` plus a parallel `layout` describing where each
+    /// came from, so the forwarded values can be written back afterward.
+    /// Shared between the driven-collection path and the shared poll.
+    fn gather_roots(&self) -> (Vec<Word>, Vec<RootSlot>) {
+        let mut roots: Vec<Word> = Vec::new();
+        let mut layout: Vec<RootSlot> = Vec::new();
+        for (i, v) in self.value_stack.iter().enumerate() {
+            collect_value_words(v, &mut roots, &mut layout, RootKind::ValueStack(i));
+        }
         for (frame_i, frame) in self.frames.iter().enumerate() {
             for (binding_i, (_, v)) in frame.bindings.iter().enumerate() {
                 collect_value_words(
                     v,
                     &mut roots,
-                    &mut layout_idx,
+                    &mut layout,
                     RootKind::Frame {
                         frame: frame_i,
                         binding: binding_i,
@@ -1035,61 +1136,16 @@ impl Interpreter {
                 );
             }
         }
-        // globals
         for (name, v) in self.globals.iter() {
-            collect_value_words(
-                v,
-                &mut roots,
-                &mut layout_idx,
-                RootKind::Global(name.clone()),
-            );
+            collect_value_words(v, &mut roots, &mut layout, RootKind::Global(name.clone()));
         }
+        (roots, layout)
+    }
 
-        // Run the GC. The closure visits each root in `roots`.
-        // The kind chooses minor vs major vs auto (auto delegates
-        // to the heap's `should_collect_major` policy).
-        match kind {
-            GcKind::Minor => {
-                self.heap.collect_minor(
-                    |evac: &mut PageEvacuator<'_, LispLayout>| {
-                        for r in roots.iter_mut() {
-                            evac.visit(r);
-                        }
-                    },
-                );
-                self.heap.recompute_auto_trigger();
-                self.stats.minor_gcs += 1;
-            }
-            GcKind::Major => {
-                self.heap.collect_major(|evac| {
-                    for r in roots.iter_mut() {
-                        evac.visit(r);
-                    }
-                });
-                self.heap.recompute_auto_trigger();
-                self.stats.major_gcs += 1;
-            }
-            GcKind::Auto => {
-                let picked_major = self.heap.should_collect_major();
-                let _result = self.heap.collect_auto(|evac| {
-                    for r in roots.iter_mut() {
-                        evac.visit(r);
-                    }
-                });
-                if picked_major {
-                    self.stats.major_gcs += 1;
-                } else {
-                    self.stats.minor_gcs += 1;
-                }
-            }
-        }
-
-        // Redistribute new Words back into the values.
-        let mut idx = 0;
-        for slot in &layout_idx {
-            let new = roots[idx];
-            idx += 1;
-            apply_redistribute(self, slot, new);
+    /// Write forwarded `Word`s back into their value slots after a cycle.
+    fn scatter_roots(&mut self, layout: &[RootSlot], roots: &[Word]) {
+        for (idx, slot) in layout.iter().enumerate() {
+            apply_redistribute(self, slot, roots[idx]);
         }
     }
 }

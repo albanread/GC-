@@ -8,14 +8,99 @@
 //! environment is walked at a safepoint, every `Word` inside every
 //! `Value` is fed through `PageEvacuator::visit`.
 
+use std::ptr::NonNull;
 use std::rc::Rc;
 
 use newgc_core::page_heap::space::PageHeap;
 use newgc_core::{
-    Generation, HeapHeader, HeapType, LispLayout, PAYLOAD_MASK, Tag, Word,
+    GcStats, Generation, HeapHeader, HeapType, LispLayout, Mutator, PAYLOAD_MASK, Tag, Word,
 };
 
-pub type Heap = PageHeap<LispLayout>;
+/// The interpreter's GC backend.
+///
+/// `Direct` drives a `PageHeap` itself — single-mutator, the original
+/// mode, behavior-identical to before this enum existed. `Shared`
+/// allocates from a `Mutator` handle on a shared `GcCoordinator` heap and
+/// cooperates at safepoints, which is what lets N interpreters run
+/// concurrently ("multi-nano-lisp").
+///
+/// The allocation + card-mark surface is identical between the two
+/// (`Mutator` forwards to the same `PageHeap` ops), so every `value.rs`
+/// allocator and the whole evaluator are unchanged; only collection and
+/// safepoint cooperation differ, handled in `eval::Interpreter`.
+pub enum Heap {
+    Direct(PageHeap<LispLayout>),
+    Shared(Mutator<LispLayout>),
+}
+
+impl Heap {
+    #[inline]
+    pub fn try_alloc_cons_in(&mut self, g: Generation) -> Option<NonNull<u64>> {
+        match self {
+            Heap::Direct(h) => h.try_alloc_cons_in(g),
+            Heap::Shared(m) => m.try_alloc_cons_in(g),
+        }
+    }
+
+    #[inline]
+    pub fn try_alloc_boxed_in(&mut self, g: Generation, n: usize) -> Option<NonNull<u64>> {
+        match self {
+            Heap::Direct(h) => h.try_alloc_boxed_in(g, n),
+            Heap::Shared(m) => m.try_alloc_boxed_in(g, n),
+        }
+    }
+
+    #[inline]
+    pub fn mark_card_at(&self, addr: *const u8) {
+        match self {
+            Heap::Direct(h) => h.mark_card_at(addr),
+            Heap::Shared(m) => m.mark_card_at(addr),
+        }
+    }
+
+    // -- Direct-only auto-GC policy knobs. In Shared mode the interpreter
+    //    cooperates via poll + drives on its own cadence, so these are
+    //    no-ops / inert there. --
+
+    pub fn set_gc_budget_min_bytes(&mut self, n: usize) {
+        if let Heap::Direct(h) = self {
+            h.set_gc_budget_min_bytes(n);
+        }
+    }
+
+    pub fn set_tenured_full_threshold_bps(&mut self, bps: u32) {
+        if let Heap::Direct(h) = self {
+            h.set_tenured_full_threshold_bps(bps);
+        }
+    }
+
+    pub fn should_collect(&self) -> bool {
+        match self {
+            Heap::Direct(h) => h.should_collect(),
+            Heap::Shared(_) => false,
+        }
+    }
+
+    pub fn should_collect_major(&self) -> bool {
+        match self {
+            Heap::Direct(h) => h.should_collect_major(),
+            Heap::Shared(_) => false,
+        }
+    }
+
+    pub fn recompute_auto_trigger(&mut self) {
+        if let Heap::Direct(h) = self {
+            h.recompute_auto_trigger();
+        }
+    }
+
+    pub fn stats(&self) -> GcStats {
+        match self {
+            Heap::Direct(h) => h.stats(),
+            Heap::Shared(_) => GcStats::default(),
+        }
+    }
+}
 
 /// Runtime value. Heap-residence is per-variant.
 ///
