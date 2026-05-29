@@ -348,42 +348,64 @@ impl<L: HeapLayout> PageHeap<L> {
         self.explicit_pins.len()
     }
 
-    /// Fold the persistent explicit-pin set into this cycle's pin state
-    /// at the start of an evacuation of `from_gen`. For every explicitly
-    /// pinned cell: insert it into `pinned_cells` and set its page's pin
-    /// byte (so Phase 1 skips it and Phase 3 flips its page in place
-    /// rather than evacuating). Then extend the mark from the pinned
-    /// objects so their transitive children survive even when the pinned
-    /// object itself is unreachable from the caller's roots, and re-seed
-    /// the per-page live counts so pin-reachable cells aren't released.
+    /// Reconcile this cycle's pin set and extend the mark from it, at the
+    /// start of an evacuation of `from_gen`.
     ///
-    /// Runs every evacuation because `clear_all_pins` wipes
-    /// `pinned_cells` at cycle end; `explicit_pins` is the durable source.
-    pub(super) fn apply_explicit_pins(&mut self, from_gen: Generation) {
-        if self.explicit_pins.is_empty() {
-            return;
-        }
-        let cells: Vec<usize> = self.explicit_pins.keys().copied().collect();
-        for &cell_idx in &cells {
-            let page_idx = cell_idx / PAGE_SIZE_CELLS;
-            // The object's page may have been relabeled to another gen by
-            // an earlier pin-flip; pin regardless of gen so whichever
-            // pass touches its gen flips it in place. Skip only the
-            // impossible-while-pinned Free case, defensively.
-            if self.desc(page_idx).generation == Generation::Free {
-                continue;
+    /// Two kinds of pin reach this point:
+    ///   - **conservative** pins, recorded by `pin_pointers_in_ranges`
+    ///     (the Mutator/`drive_collect` and coordinator paths run it
+    ///     before evacuation); and
+    ///   - **explicit** (FFI) pins held durably in `explicit_pins`.
+    ///
+    /// Explicit pins are folded into `pinned_cells` (insert + set the
+    /// page's pin byte so Phase 1 skips them and Phase 3 flips their page
+    /// in place). Then — for the FULL pin set — extend the mark from every
+    /// pinned object so its transitive children survive even when the
+    /// pinned object isn't reachable from the caller's precise roots, and
+    /// re-seed the per-page live counts so pin-reachable cells aren't
+    /// released.
+    ///
+    /// The extension mark MUST run whenever any cell is pinned, NOT only
+    /// when there are explicit pins. The conservative pin scan runs after
+    /// the precise mark, so a conservatively-pinned object's children are
+    /// unmarked until this extension; skipping it (e.g. early-returning on
+    /// an empty `explicit_pins` set) silently reclaims those children,
+    /// dropping whole sub-chains and dangling the pinned object's pointers
+    /// into freed memory. The coordinator path extends the mark itself;
+    /// the bare `collect_minor`/`drive_collect` path relies entirely on
+    /// this call.
+    ///
+    /// Runs every evacuation because `clear_all_pins` wipes `pinned_cells`
+    /// at cycle end; `explicit_pins` is the durable source for FFI pins.
+    pub(super) fn apply_pins_and_extend_mark(&mut self, from_gen: Generation) {
+        // Fold durable explicit (FFI) pins into this cycle's pin set.
+        if !self.explicit_pins.is_empty() {
+            let cells: Vec<usize> =
+                self.explicit_pins.keys().copied().collect();
+            for &cell_idx in &cells {
+                let page_idx = cell_idx / PAGE_SIZE_CELLS;
+                // The object's page may have been relabeled to another gen
+                // by an earlier pin-flip; pin regardless of gen so whichever
+                // pass touches its gen flips it in place. Skip only the
+                // impossible-while-pinned Free case, defensively.
+                if self.desc(page_idx).generation == Generation::Free {
+                    continue;
+                }
+                self.pinned_cells.insert(cell_idx);
+                let slot =
+                    ((cell_idx % PAGE_SIZE_CELLS) / CELLS_PER_PIN_SLOT) as u8;
+                self.desc_mut(page_idx).set_pin(slot);
             }
-            self.pinned_cells.insert(cell_idx);
-            let slot =
-                ((cell_idx % PAGE_SIZE_CELLS) / CELLS_PER_PIN_SLOT) as u8;
-            self.desc_mut(page_idx).set_pin(slot);
         }
         // A pinned object is effectively a root: mark its children
         // (same-gen and cross-gen into `from_gen`) so they survive, then
-        // re-seed live counts. Only meaningful while a mark/recycle pass
-        // is active for `from_gen` — the evac driver seeds it just before
-        // calling us.
-        if self.recycle_live_counts_active_for(from_gen) {
+        // re-seed live counts. Runs for the whole pin set (conservative +
+        // explicit) — see the method doc. Only meaningful while a
+        // mark/recycle pass is active for `from_gen`, which the evac
+        // driver seeds just before calling us.
+        if self.recycle_live_counts_active_for(from_gen)
+            && !self.pinned_cells.is_empty()
+        {
             self.extend_mark_from_pinned(from_gen);
             self.extend_mark_from_cross_gen_pinned(from_gen);
             self.prepare_recycle_live_counts_from_marks(from_gen);

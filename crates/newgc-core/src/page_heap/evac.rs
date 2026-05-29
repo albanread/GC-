@@ -720,13 +720,16 @@ impl<L: HeapLayout> PageHeap<L> {
             self.prepare_recycle_live_counts_from_marks(from_gen);
         }
 
-        // MM-0: fold persistent explicit (FFI) pins into this cycle's
-        // pin state and mark their children. Must run after the mark /
+        // Reconcile the pin set (fold durable FFI pins) and extend the
+        // mark from EVERY pinned object — conservative pins from
+        // `pin_pointers_in_ranges` as well as explicit ones — so a pinned
+        // object's transitive children survive instead of being reclaimed
+        // out from under its pointers. Must run after the mark /
         // recycle-count seed is established and before the pinned-cells
         // snapshot below. `clear_all_pins` (end of cycle) wipes the
         // per-cycle pin set, so this re-applies the durable pins every
         // evacuation.
-        self.apply_explicit_pins(from_gen);
+        self.apply_pins_and_extend_mark(from_gen);
 
         // Snapshot the pinned cells with their is_cons bit BEFORE
         // any start-bit clearing happens. Each chunk's Phase 3 uses
