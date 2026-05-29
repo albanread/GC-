@@ -505,6 +505,127 @@ impl<'a, L: HeapLayout> PageEvacuator<'a, L> {
             unsafe { (self.heap.base_ptr() as *const u64).add(cell_idx) };
         unsafe { *p }
     }
+
+    /// Reservation base as a `*mut u64`, so a caller (the dirty-card
+    /// scanner) can tell whether the region it's scanning is the heap
+    /// reservation (object-aware scan available) or an external area
+    /// like the static segment (cell-by-cell only).
+    pub fn reservation_base(&self) -> *mut u64 {
+        self.heap.base_ptr() as *mut u64
+    }
+
+    /// `(total_cells, pointer_cells_start, pointer_cells_end)` for the
+    /// object starting at `cell_idx`, expressed as cell offsets from the
+    /// start. Mirrors `mark_scan_object`'s decode: cons = 2 cells, both
+    /// pointers; boxed/large = `header_layout`. An opaque payload (e.g. a
+    /// byte-string) reports an empty pointer range, so a card scan visits
+    /// none of its bytes.
+    fn object_pointer_cells(&self, cell_idx: usize) -> (usize, usize, usize) {
+        let page = cell_idx / PAGE_SIZE_CELLS;
+        let kind = self.heap.desc(page).kind;
+        let is_cons = match kind {
+            PageKind::Cons => true,
+            PageKind::Boxed => super::alloc::is_cons_start_at(
+                self.heap.start_bits_slice(),
+                cell_idx,
+            ),
+            PageKind::Large => false,
+            PageKind::Free => return (1, 0, 0),
+        };
+        if is_cons {
+            (2, 0, 2)
+        } else {
+            let header_ptr =
+                unsafe { (self.heap.base_ptr() as *const u64).add(cell_idx) };
+            let layout = unsafe { L::header_layout(header_ptr) };
+            (layout.total_cells, layout.pointer_cells_start, layout.pointer_cells_end)
+        }
+    }
+
+    /// Start cell of the object whose extent covers `cell` (it may begin
+    /// earlier in the page, or — for a Large run — on an earlier page),
+    /// or `None` if `cell` precedes the first object on its page / sits
+    /// in an unused tail with no start at or below it.
+    fn object_start_at_or_before(&self, cell: usize) -> Option<usize> {
+        let page = cell / PAGE_SIZE_CELLS;
+        let kind = self.heap.desc(page).kind;
+        if kind == PageKind::Large {
+            // Resolve to the run head (possibly on an earlier page).
+            let mut h = page;
+            if !self.heap.desc(h).is_large_head() {
+                while h > 0 && self.heap.desc(h).is_large_cont() {
+                    h -= 1;
+                }
+            }
+            return Some(h * PAGE_SIZE_CELLS);
+        }
+        if matches!(kind, PageKind::Free) {
+            return None;
+        }
+        let page_first = page * PAGE_SIZE_CELLS;
+        let mut s = cell;
+        loop {
+            if is_start_at(self.heap.start_bits_slice(), s) {
+                return Some(s);
+            }
+            if s == page_first {
+                return None;
+            }
+            s -= 1;
+        }
+    }
+
+    /// **Object-aware** dirty-card scan over reservation cells
+    /// `[start, end)`: walk live objects via start bits + layout and
+    /// offer only each object's *pointer* cells to `visit_cell`.
+    ///
+    /// This replaces a naive cell-by-cell scan, which treated every cell
+    /// in a dirty card as a candidate pointer. That was unsound for
+    /// objects with **opaque byte payloads** (`<byte-string>`): arbitrary
+    /// bytes can alias an in-reservation pointer to a real object start,
+    /// so the mark phase would resurrect dead objects and the rewrite
+    /// phase would *overwrite the opaque payload* with a relocated
+    /// address (GAP-010). Tagged-Word payloads (cons / vector) can't
+    /// alias — a fixnum's low bit is 0 — which is why this only ever bit
+    /// byte-strings, and why no test caught it until one was card-scanned.
+    ///
+    /// SAFETY: `start`/`end` are global cell indices within the
+    /// reservation; the card table guarantees `end <= total_cells`.
+    pub unsafe fn visit_card_pointer_cells(&mut self, start: usize, end: usize) {
+        let base = self.heap.base_ptr() as *mut u64;
+        // Position at the object covering `start` (may begin earlier), or
+        // the first object start within the card if `start` is in a tail.
+        let mut s = match self.object_start_at_or_before(start) {
+            Some(s) => s,
+            None => {
+                let mut t = start;
+                while t < end
+                    && !is_start_at(self.heap.start_bits_slice(), t)
+                {
+                    t += 1;
+                }
+                t
+            }
+        };
+        while s < end {
+            if !is_start_at(self.heap.start_bits_slice(), s) {
+                // Unused tail between the last object and the card end:
+                // bump-allocated pages have no inter-object gaps, so this
+                // means there are no further objects in this card span.
+                break;
+            }
+            let (size, p_start, p_end) = self.object_pointer_cells(s);
+            for off in p_start..p_end {
+                // SAFETY: a pointer cell of a live object; in-reservation,
+                // u64-aligned.
+                unsafe { self.visit_cell(base.add(s + off)) };
+            }
+            if size == 0 {
+                break;
+            }
+            s += size;
+        }
+    }
 }
 
 impl<L: HeapLayout> PageHeap<L> {

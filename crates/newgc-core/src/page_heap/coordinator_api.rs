@@ -632,15 +632,23 @@ pub(super) fn scan_dirty_cards_as_roots<L: HeapLayout>(
             }
         }
 
-        // Scan each cell as a candidate Word.
-        for c in card_start..card_end {
-            // SAFETY: c < cells, so `base.add(c)` is in-range of
-            // the caller-supplied buffer; `visit_cell`'s contract
-            // demands an aligned u64 cell, which `base.add(c)`
-            // satisfies since `base` is u64-aligned and `c` is a
-            // u64 offset.
-            let cell_ptr = unsafe { base.add(c) };
-            unsafe { evac.visit_cell(cell_ptr) };
+        if base == evac.reservation_base() {
+            // Heap reservation: walk objects and offer only their pointer
+            // cells, so opaque byte payloads (<byte-string>) are never
+            // misread as heap pointers (GAP-010).
+            unsafe { evac.visit_card_pointer_cells(card_start, card_end) };
+        } else {
+            // External region (the static segment) has no start bits, so
+            // there's no object structure to walk — scan cell-by-cell.
+            // (A static byte-string literal whose bytes alias a heap
+            // pointer is a separate, lower-risk concern: static data is
+            // immutable and pinned.)
+            for c in card_start..card_end {
+                // SAFETY: c < cells, so `base.add(c)` is in-range of the
+                // caller-supplied buffer; aligned u64 cell.
+                let cell_ptr = unsafe { base.add(c) };
+                unsafe { evac.visit_cell(cell_ptr) };
+            }
         }
     }
 }
