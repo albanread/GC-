@@ -18,6 +18,69 @@ fn expect_number(v: Value) -> i64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Resilience sweep — the tests above each pin one `random-seed!`; this runs
+// many *fresh* seeds through a realistic Lisp churn workload that keeps a
+// rooted "golden" list whose sum is FIXED at 1225 regardless of the random
+// churn. The churn (lists + vectors + periodic `gc-now`) promotes and
+// compacts `golden` across minor/major/full cycles and exercises the real
+// card barrier (alloc_pair / vector-set!) and cross-gen pointers; if any
+// cycle loses, mis-forwards, or tears a cell of the live `golden` list, the
+// sum != 1225 and the assert fires. `newgc_core::crash::install()` turns a
+// segfault into a faulting-address + backtrace report.
+//
+// Tunable: NEWGC_LISP_SWEEP_SEEDS (default 30). Churn depth is fixed (the
+// tree-walking interpreter recurses per iteration), so scale via seeds:
+//   NEWGC_LISP_SWEEP_SEEDS=2000 cargo test -p newgc-test-lisp \
+//     --test lisp_stochastic golden_survival -- --nocapture
+fn run_golden_survival(seed: u64) {
+    let mut i = Interpreter::new(32 * 64 * 1024);
+    i.set_minor_threshold(120);
+    i.set_majors_every(5);
+    let src = format!(
+        r#"
+        (random-seed! {seed})
+        ; golden: a rooted 50-element list 0..49, sum = 1225, never mutated.
+        (define (mk-golden i) (if (= i 50) nil (cons i (mk-golden (+ i 1)))))
+        (define golden (mk-golden 0))
+        ; churn: allocate garbage lists + vectors and periodically force a
+        ; collection, so `golden` is promoted/compacted under pressure.
+        (define (build-list n)
+          (if (= n 0) nil (cons (random 100) (build-list (- n 1)))))
+        (define (churn k)
+          (if (= k 0)
+              nil
+              (begin
+                (length (build-list (random 20)))
+                (vector-length (make-vector (random 8) (random 100)))
+                (if (= (random 6) 0) (gc-now) nil)
+                (churn (- k 1)))))
+        (define (sum xs) (if (null? xs) 0 (+ (car xs) (sum (cdr xs)))))
+        (churn 250)
+        (sum golden)
+    "#
+    );
+    let v = i.run_source(&src).expect("lisp run errored");
+    assert_eq!(
+        expect_number(v),
+        1225,
+        "rooted golden list corrupted across GC (seed={seed})"
+    );
+}
+
+#[test]
+fn lisp_golden_survival_seed_sweep() {
+    newgc_core::crash::install();
+    let n: u64 = std::env::var("NEWGC_LISP_SWEEP_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    for s in 0..n {
+        run_golden_survival(0x1150_0000u64.wrapping_add(s));
+    }
+    eprintln!("lisp_golden_survival_seed_sweep: {n} fresh seeds OK");
+}
+
 fn interp_for_stochastic() -> Interpreter {
     let mut i = Interpreter::new(32 * 64 * 1024);
     i.set_minor_threshold(300);
