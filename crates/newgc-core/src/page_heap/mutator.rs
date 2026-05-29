@@ -1,21 +1,28 @@
-//! Multi-mutator front end — sprint MM-1.
+//! Multi-mutator front end.
 //!
-//! Introduces the *handle* API shape without changing performance or
-//! the collector. A [`GcCoordinator`] owns the heap behind an
-//! `Arc<Mutex<PageHeap>>` and hands out [`Mutator`] handles; any number
-//! of threads can each hold a handle and allocate. Allocation is
-//! **serialized by the heap mutex** in MM-1 — there are no per-thread
-//! TLABs (MM-3) and no safepoints (MM-4) yet. The mutex also makes
-//! allocation and collection mutually exclusive, so the collector still
-//! sees a consistent heap.
+//! A [`GcCoordinator`] owns the heap behind an `Arc<Mutex<PageHeap>>` and
+//! hands out [`Mutator`] handles; any number of threads can each hold a
+//! handle and allocate concurrently.
 //!
-//! **Soundness caveat (until MM-5).** Collection roots still come from
-//! the single closure passed to [`GcCoordinator::collect_minor`] et al.
-//! With more than one live mutator, that closure must enumerate *every*
-//! mutator's roots, or a mutator's live objects can be reclaimed.
-//! Per-mutator root enumeration lands in MM-5; until then, multi-mutator
-//! GC is only safe when the caller supplies all roots (or none). See
-//! `docs/MULTI_MUTATOR_DESIGN.md` §8.
+//! Current model (MM-3 … MM-7 have landed):
+//! - **Per-thread lock-free TLABs** (MM-3): the fast path bumps a
+//!   thread-local slab with no lock; only TLAB *refill* takes the heap
+//!   mutex. The mutex still makes refill/collection mutually exclusive.
+//! - **Safepoint protocol** (MM-4): any mutator can drive a
+//!   stop-the-world collection ([`drive_collect`]); peers park at their
+//!   next safepoint poll. The handshake (`epoch` / `world_running` /
+//!   `is_acting_coordinator`, parked under `park_mutex` + `park_cv`)
+//!   serializes drivers via `coord_mutex` and resumes the world on every
+//!   exit path (including an OOM unwind) via `ResumeGuard`.
+//! - **Per-mutator root snapshots** (MM-5): each mutator publishes its
+//!   own roots into `roots_snapshot` at the safepoint; the driver visits
+//!   **every** active mutator's snapshot (updated in place by the
+//!   evacuator) in addition to the caller's `extra` closure. Callers must
+//!   therefore supply only the driving thread's *extra* roots — NOT every
+//!   thread's roots. Threads blocked in foreign code (`IN_NATIVE`, MM-6)
+//!   publish their roots before leaving and are collected around.
+//!
+//! See `docs/MULTI_MUTATOR_DESIGN.md`.
 
 use std::marker::PhantomData;
 use std::ptr::NonNull;
@@ -844,9 +851,16 @@ impl<L: HeapLayout> Mutator<L> {
                 {
                     let _g = sp.park_mutex.lock().unwrap();
                     sp.world_running.store(1, Ordering::Release);
+                    // Clear the coordinator flag UNDER park_mutex too — it is
+                    // *set* under the lock at the top of `drive_collect`, so
+                    // mirror that here. A peer driver woken by this same notify
+                    // then observes a consistent (world-running,
+                    // not-coordinator) state in one re-evaluation of its wait
+                    // predicate, instead of racing a bare Release store that it
+                    // can observe late and so wait out the full timeout.
+                    self.inner.is_acting_coordinator.store(false, Ordering::Release);
                     sp.park_cv.notify_all();
                 }
-                self.inner.is_acting_coordinator.store(false, Ordering::Release);
             }
         }
 

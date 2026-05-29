@@ -93,6 +93,61 @@ impl<'a, L: HeapLayout> PageMarker<'a, L> {
                 .scan_marked_object(cell_idx, self.target, &mut self.queue);
         }
     }
+
+    /// Reservation base, so the dirty-card scanner can tell whether the
+    /// region it's scanning is the heap reservation (object-aware scan
+    /// available) or an external area like the static segment.
+    pub(crate) fn reservation_base(&self) -> *mut u64 {
+        self.heap.base_ptr() as *mut u64
+    }
+
+    /// **Object-aware** dirty-card mark scan over reservation cells
+    /// `[start, end)`: walk live objects via start bits + layout and offer
+    /// only each object's *pointer* cells to `visit_cell`. The mark-path
+    /// mirror of `PageEvacuator::visit_card_pointer_cells`.
+    ///
+    /// Without this, the cross-gen card mark scan would treat a
+    /// `<byte-string>`'s **opaque byte payload** as candidate pointers: bytes
+    /// that alias an in-reservation pointer to a real object start would
+    /// spuriously **mark (resurrect) a dead object**, which the coordinator's
+    /// evacuator then copies/promotes (it reuses these marks) — floating
+    /// garbage that minors never reclaim. This is the mark-phase twin of the
+    /// GAP-010 rewrite-path fix.
+    ///
+    /// SAFETY: `start`/`end` are global cell indices within the reservation;
+    /// the card table guarantees `end <= total_cells`.
+    pub(crate) unsafe fn visit_card_pointer_cells(&mut self, start: usize, end: usize) {
+        use super::evac::{object_pointer_cells, object_start_at_or_before};
+        let base = self.heap.base_ptr() as *mut u64;
+        // Position at the object covering `start` (may begin earlier), or the
+        // first object start within the card if `start` is in a tail.
+        let mut s = match object_start_at_or_before(self.heap, start) {
+            Some(s) => s,
+            None => {
+                let mut t = start;
+                while t < end && !is_start_at(self.heap.start_bits_slice(), t) {
+                    t += 1;
+                }
+                t
+            }
+        };
+        while s < end {
+            if !is_start_at(self.heap.start_bits_slice(), s) {
+                // Bump-allocated pages have no inter-object gaps, so an
+                // unused tail means no further objects in this card span.
+                break;
+            }
+            let (size, p_start, p_end) = object_pointer_cells(self.heap, s);
+            for off in p_start..p_end {
+                // SAFETY: pointer cell of a live object; in-reservation, aligned.
+                unsafe { self.visit_cell(base.add(s + off)) };
+            }
+            if size == 0 {
+                break;
+            }
+            s += size;
+        }
+    }
 }
 
 pub struct MarkScanner<'s, 'a: 's, L: HeapLayout> {

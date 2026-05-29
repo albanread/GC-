@@ -514,67 +514,6 @@ impl<'a, L: HeapLayout> PageEvacuator<'a, L> {
         self.heap.base_ptr() as *mut u64
     }
 
-    /// `(total_cells, pointer_cells_start, pointer_cells_end)` for the
-    /// object starting at `cell_idx`, expressed as cell offsets from the
-    /// start. Mirrors `mark_scan_object`'s decode: cons = 2 cells, both
-    /// pointers; boxed/large = `header_layout`. An opaque payload (e.g. a
-    /// byte-string) reports an empty pointer range, so a card scan visits
-    /// none of its bytes.
-    fn object_pointer_cells(&self, cell_idx: usize) -> (usize, usize, usize) {
-        let page = cell_idx / PAGE_SIZE_CELLS;
-        let kind = self.heap.desc(page).kind;
-        let is_cons = match kind {
-            PageKind::Cons => true,
-            PageKind::Boxed => super::alloc::is_cons_start_at(
-                self.heap.start_bits_slice(),
-                cell_idx,
-            ),
-            PageKind::Large => false,
-            PageKind::Free => return (1, 0, 0),
-        };
-        if is_cons {
-            (2, 0, 2)
-        } else {
-            let header_ptr =
-                unsafe { (self.heap.base_ptr() as *const u64).add(cell_idx) };
-            let layout = unsafe { L::header_layout(header_ptr) };
-            (layout.total_cells, layout.pointer_cells_start, layout.pointer_cells_end)
-        }
-    }
-
-    /// Start cell of the object whose extent covers `cell` (it may begin
-    /// earlier in the page, or — for a Large run — on an earlier page),
-    /// or `None` if `cell` precedes the first object on its page / sits
-    /// in an unused tail with no start at or below it.
-    fn object_start_at_or_before(&self, cell: usize) -> Option<usize> {
-        let page = cell / PAGE_SIZE_CELLS;
-        let kind = self.heap.desc(page).kind;
-        if kind == PageKind::Large {
-            // Resolve to the run head (possibly on an earlier page).
-            let mut h = page;
-            if !self.heap.desc(h).is_large_head() {
-                while h > 0 && self.heap.desc(h).is_large_cont() {
-                    h -= 1;
-                }
-            }
-            return Some(h * PAGE_SIZE_CELLS);
-        }
-        if matches!(kind, PageKind::Free) {
-            return None;
-        }
-        let page_first = page * PAGE_SIZE_CELLS;
-        let mut s = cell;
-        loop {
-            if is_start_at(self.heap.start_bits_slice(), s) {
-                return Some(s);
-            }
-            if s == page_first {
-                return None;
-            }
-            s -= 1;
-        }
-    }
-
     /// **Object-aware** dirty-card scan over reservation cells
     /// `[start, end)`: walk live objects via start bits + layout and
     /// offer only each object's *pointer* cells to `visit_cell`.
@@ -595,7 +534,7 @@ impl<'a, L: HeapLayout> PageEvacuator<'a, L> {
         let base = self.heap.base_ptr() as *mut u64;
         // Position at the object covering `start` (may begin earlier), or
         // the first object start within the card if `start` is in a tail.
-        let mut s = match self.object_start_at_or_before(start) {
+        let mut s = match object_start_at_or_before(self.heap, start) {
             Some(s) => s,
             None => {
                 let mut t = start;
@@ -614,7 +553,7 @@ impl<'a, L: HeapLayout> PageEvacuator<'a, L> {
                 // means there are no further objects in this card span.
                 break;
             }
-            let (size, p_start, p_end) = self.object_pointer_cells(s);
+            let (size, p_start, p_end) = object_pointer_cells(self.heap, s);
             for off in p_start..p_end {
                 // SAFETY: a pointer cell of a live object; in-reservation,
                 // u64-aligned.
@@ -625,6 +564,71 @@ impl<'a, L: HeapLayout> PageEvacuator<'a, L> {
             }
             s += size;
         }
+    }
+}
+
+/// `(total_cells, pointer_cells_start, pointer_cells_end)` for the object
+/// starting at `cell_idx`, as cell offsets from the start. Cons = 2 cells,
+/// both pointers; boxed/large = `header_layout`. An opaque payload (e.g. a
+/// `<byte-string>`) reports an empty pointer range, so a card scan visits
+/// none of its bytes. Shared by the evacuator's and the marker's
+/// object-aware card scans (free fn so both `&PageHeap` callers reach it).
+pub(super) fn object_pointer_cells<L: HeapLayout>(
+    heap: &PageHeap<L>,
+    cell_idx: usize,
+) -> (usize, usize, usize) {
+    let page = cell_idx / PAGE_SIZE_CELLS;
+    let kind = heap.desc(page).kind;
+    let is_cons = match kind {
+        PageKind::Cons => true,
+        PageKind::Boxed => {
+            super::alloc::is_cons_start_at(heap.start_bits_slice(), cell_idx)
+        }
+        PageKind::Large => false,
+        PageKind::Free => return (1, 0, 0),
+    };
+    if is_cons {
+        (2, 0, 2)
+    } else {
+        let header_ptr = unsafe { (heap.base_ptr() as *const u64).add(cell_idx) };
+        let layout = unsafe { L::header_layout(header_ptr) };
+        (layout.total_cells, layout.pointer_cells_start, layout.pointer_cells_end)
+    }
+}
+
+/// Start cell of the object whose extent covers `cell` (it may begin
+/// earlier in the page, or — for a Large run — on an earlier page), or
+/// `None` if `cell` precedes the first object on its page / sits in an
+/// unused tail with no start at or below it. Shared by both card scans.
+pub(super) fn object_start_at_or_before<L: HeapLayout>(
+    heap: &PageHeap<L>,
+    cell: usize,
+) -> Option<usize> {
+    let page = cell / PAGE_SIZE_CELLS;
+    let kind = heap.desc(page).kind;
+    if kind == PageKind::Large {
+        // Resolve to the run head (possibly on an earlier page).
+        let mut h = page;
+        if !heap.desc(h).is_large_head() {
+            while h > 0 && heap.desc(h).is_large_cont() {
+                h -= 1;
+            }
+        }
+        return Some(h * PAGE_SIZE_CELLS);
+    }
+    if matches!(kind, PageKind::Free) {
+        return None;
+    }
+    let page_first = page * PAGE_SIZE_CELLS;
+    let mut s = cell;
+    loop {
+        if is_start_at(heap.start_bits_slice(), s) {
+            return Some(s);
+        }
+        if s == page_first {
+            return None;
+        }
+        s -= 1;
     }
 }
 
@@ -760,12 +764,34 @@ impl<L: HeapLayout> PageHeap<L> {
         let mut total_pages_freed = 0usize;
         let mut total_pages_flipped = 0usize;
 
+        // Distinct from_gen pages that carry a pin. Pinned pages flip in
+        // place in Phase 3 (they keep their pinned objects) instead of
+        // returning to Free, so they NEVER replenish the chunk budget.
+        // Excluding them from the budget keeps a chunk from over-committing
+        // dest demand against pages that won't free — a false mid-evac OOM
+        // on a heap with enough Free overall but badly distributed. This is
+        // a no-op for precise-only clients (the pin set is empty), and only
+        // ever shrinks a chunk, so it can never make evacuation *less* safe.
+        let pinned_pages: Vec<usize> = {
+            let mut v: Vec<usize> =
+                self.pinned_cells.iter().map(|&c| c / PAGE_SIZE_CELLS).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+
         // Step 3: chunked loop.
         let mut idx = 0;
         while idx < from_pages.len() {
             let avail_free = self.count_pages_in_gen(Generation::Free);
-            // Pick chunk_size at 7/8 of avail_free. The 1/8 margin
-            // absorbs two sources of dest-demand slop:
+            // Pages still pinned in from_gen (already-flipped ones have left
+            // from_gen, so they drop out naturally as the loop progresses).
+            let pinned_pending = pinned_pages
+                .iter()
+                .filter(|&&p| self.desc(p).generation == from_gen)
+                .count();
+            // Pick chunk_size at 7/8 of the *replenishable* free budget. The
+            // 1/8 margin absorbs two sources of dest-demand slop:
             //   - per-page density variance (older source pages
             //     have more dead cells than newer ones; the
             //     "1 source → 1 dest" worst case is conservative on
@@ -773,7 +799,8 @@ impl<L: HeapLayout> PageHeap<L> {
             //   - dest allocator fragmentation when a boxed object
             //     can't fit in the current dest page's tail.
             // Floor at 1 to guarantee progress; cap at remaining.
-            let chunk_size = ((avail_free * 7) / 8)
+            let effective_free = avail_free.saturating_sub(pinned_pending);
+            let chunk_size = ((effective_free * 7) / 8)
                 .max(1)
                 .min(from_pages.len() - idx);
             let chunk_pages: Vec<usize> =

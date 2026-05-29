@@ -681,9 +681,23 @@ fn scan_dirty_cards_as_marks<L: HeapLayout>(
             }
         }
 
-        for c in card_start..card_end {
-            let cell_ptr = unsafe { base.add(c) };
-            unsafe { marker.visit_cell(cell_ptr) };
+        if base == marker.reservation_base() {
+            // Heap reservation: walk objects and offer only their pointer
+            // cells, so opaque byte payloads (<byte-string>) are never
+            // misread as heap pointers and used to spuriously mark
+            // (resurrect) dead objects — the mark-phase twin of the GAP-010
+            // rewrite-path fix in `scan_dirty_cards_as_roots`.
+            unsafe { marker.visit_card_pointer_cells(card_start, card_end) };
+        } else {
+            // External region (the static segment) has no start bits, so
+            // there's no object structure to walk — scan cell-by-cell.
+            // (A static byte-string literal whose immutable, compile-time
+            // bytes alias a heap pointer is a separate, far-lower-risk
+            // concern: it would have to equal a live runtime address.)
+            for c in card_start..card_end {
+                let cell_ptr = unsafe { base.add(c) };
+                unsafe { marker.visit_cell(cell_ptr) };
+            }
         }
     }
 }
@@ -713,6 +727,89 @@ mod tests {
         let h = PageHeap::<crate::lisp_layout::LispLayout>::new(0, 0);
         assert_eq!(h.page_count(), 4);
         assert_eq!(h.reserved_bytes(), 4 * 64 * 1024);
+    }
+
+    /// GAP-010 mark-phase twin. The coordinator's cross-gen **mark** card
+    /// scan (`mark_minor_with_static` → `scan_dirty_cards_as_marks`) must
+    /// be object-aware: a `<byte-string>`-style opaque payload whose bytes
+    /// alias a pointer to a real G0 object start must NOT spuriously mark
+    /// (resurrect) that object. Before the fix, the scan walked every card
+    /// cell and would mark the dead cons; after it, the opaque payload is
+    /// skipped. (The rewrite-path twin is
+    /// `tests/gap010_major_root_rewrite.rs::gap010_card_scan_*`.)
+    #[test]
+    fn mark_card_scan_must_not_treat_byte_payload_as_pointer() {
+        use crate::heap_common::{CardTable, HeapHeader, HeapType};
+        use crate::word::{Tag, Word, PAYLOAD_MASK};
+
+        let mut h = small_heap();
+        let base = h.base_ptr() as usize;
+        let gen_of = |h: &PageHeap<_>, w: Word| {
+            let a = (w.raw() & PAYLOAD_MASK) as *const u8;
+            h.page_of(a).map(|p| h.desc(p).generation)
+        };
+
+        // A rooted String-shaped object with an opaque 3-cell payload.
+        let mut keep = {
+            let p = h.try_alloc_boxed_in(Generation::G0, 4).expect("string alloc");
+            unsafe {
+                *p.as_ptr() = HeapHeader::new(HeapType::String, 3).raw();
+                for i in 1..=3 {
+                    *p.as_ptr().add(i) = 0;
+                }
+            }
+            Word::from_ptr(p.as_ptr() as *const u8, Tag::String)
+        };
+
+        // Promote `keep` out of G0 so its card is eligible for the cross-gen
+        // mark scan (which only fires on G1/Tenured pages).
+        let mut promoted = false;
+        for _ in 0..16 {
+            h.collect_minor(|e| e.visit(&mut keep));
+            if gen_of(&h, keep) != Some(Generation::G0) {
+                promoted = true;
+                break;
+            }
+        }
+        assert!(promoted, "keep should promote out of G0");
+
+        // A dead, UNROOTED cons in G0 — must not survive a collection.
+        let target = {
+            let p = h.try_alloc_cons_in(Generation::G0).unwrap();
+            unsafe {
+                *p.as_ptr() = Word::fixnum(7).raw();
+                *p.as_ptr().add(1) = Word::NIL.raw();
+            }
+            Word::from_ptr(p.as_ptr() as *const u8, Tag::Cons)
+        };
+        let target_cell = ((target.raw() & PAYLOAD_MASK) as usize - base) / 8;
+
+        // Plant a cons-tagged pointer to the dead cons into keep's opaque
+        // payload, and dirty keep's card (as a neighbouring write barrier
+        // would have).
+        let keep_base = (keep.raw() & PAYLOAD_MASK) as *mut u64;
+        unsafe {
+            *keep_base.add(1) = target.raw();
+            h.mark_card_at(keep_base.add(1) as *const u8);
+        }
+
+        // Drive ONLY the mark pass (the buggy path), visiting just keep.
+        // An empty static area: one clean cell, no dirty cards.
+        let static_cards = CardTable::new(64);
+        let mut static_area = [0u64; 1];
+        let static_base = static_area.as_mut_ptr();
+        h.mark_minor_with_static(&static_cards, static_base, 1, &mut |s| {
+            s.visit(&mut keep);
+        });
+
+        // Decisive: the dead cons must NOT be marked. (keep is visited as a
+        // root but lives in an older gen, so the ONLY way `target` gets
+        // marked is the card scan following keep's opaque payload bytes.)
+        assert!(
+            !h.is_marked(target_cell),
+            "mark-path card scan followed a byte-string's opaque payload and \
+             marked a dead object (floating garbage / spurious tenuring)"
+        );
     }
 
     #[test]
