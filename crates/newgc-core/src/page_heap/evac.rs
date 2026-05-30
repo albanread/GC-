@@ -726,9 +726,9 @@ impl<L: HeapLayout> PageHeap<L> {
         // object's transitive children survive instead of being reclaimed
         // out from under its pointers. Must run after the mark /
         // recycle-count seed is established and before the pinned-cells
-        // snapshot below. `clear_all_pins` (end of cycle) wipes the
-        // per-cycle pin set, so this re-applies the durable pins every
-        // evacuation.
+        // snapshot below. The logical-cycle driver (cycle.rs) calls
+        // `clear_all_pins` after all its sub-evacs complete, so this
+        // re-applies the durable explicit pins every evacuation.
         self.apply_pins_and_extend_mark(from_gen);
 
         // Snapshot the pinned cells with their is_cons bit BEFORE
@@ -833,8 +833,42 @@ impl<L: HeapLayout> PageHeap<L> {
             idx += chunk_size;
         }
 
+        // DEBUG: every pinned object must survive this cycle in place,
+        // with its start bit intact. If a pinned cell lost its start bit
+        // it was zeroed/released by Phase 3 — the smoking gun for the
+        // pinned-object-destroyed corruption.
+        #[cfg(debug_assertions)]
+        {
+            let pc: Vec<usize> = self.pinned_cells.iter().copied().collect();
+            for cell_idx in pc {
+                debug_assert!(
+                    is_start_at(self.start_bits_slice(), cell_idx),
+                    "pinned cell {cell_idx} (page {}) lost its start bit during evac \
+                     from_gen={from_gen:?} dest_gen={dest_gen:?}",
+                    cell_idx / PAGE_SIZE_CELLS
+                );
+            }
+        }
+
         // Step 4: end-of-cycle cleanup.
-        self.clear_all_pins();
+        //
+        // NB: `clear_all_pins` is NOT called here. A logical GC cycle (one
+        // `collect_minor` / `collect_major` / `collect_full` invocation)
+        // may run multiple `evacuate_with_roots` passes back-to-back —
+        // notably a `collect_minor` that cascades G0→G1 then G1→Tenured.
+        // The conservative pin scan runs ONCE before the logical cycle
+        // starts and seeds pins for ALL generations the cycle may touch
+        // (e.g. drive_collect pins both G0 and G1 before calling
+        // `collect_minor`). Clearing pins between the G0→G1 and
+        // G1→Tenured passes would wipe the G1 pins, leaving live G1
+        // objects unprotected during the cascade — they'd be reclaimed
+        // because no precise root reached them either. (This was the
+        // cons-elision / random-data-loss bug: NCL's stack-resident G1
+        // pointers got their pages released by the cascade.)
+        //
+        // The logical-cycle entry points (`cycle.rs` `collect_minor`,
+        // `collect_major`, `collect_full`) are responsible for calling
+        // `clear_all_pins` AFTER all their sub-evacs complete.
         self.clear_mark_bits_in_gen(from_gen);
         self.clear_recycle_live_counts();
 
@@ -1360,6 +1394,18 @@ impl<L: HeapLayout> PageHeap<L> {
 
                 flipped += 1;
             } else {
+                // DEBUG: a page that holds a pinned cell must take the
+                // FLIP path, never RELEASE — releasing zeroes the pinned
+                // object. If this fires, `has_pins()` disagrees with the
+                // pinned-cell set (the smoking gun for the elision).
+                debug_assert!(
+                    !pinned_with_kind
+                        .iter()
+                        .any(|&(c, _)| c / PAGE_SIZE_CELLS == page_idx),
+                    "phase3 RELEASING page {page_idx} that holds a pinned cell \
+                     (has_pins={})",
+                    self.desc(page_idx).has_pins()
+                );
                 // RELEASE. The page goes to Free; its bytes are
                 // useless to anyone post-cycle. Zero them now so a
                 // stale Word that points into this page between
@@ -2012,9 +2058,19 @@ mod tests {
     #[test]
 
     fn pins_and_mark_bits_are_cleared_after_cycle() {
-        // After evacuate completes, pinned_cells must be empty
-        // and the from-gen's mark bits cleared, so the next cycle
-        // starts from a clean state.
+        // After a complete GC cycle (mark + pin + evacuate +
+        // end-of-cycle cleanup), pinned_cells must be empty and the
+        // from-gen's mark bits cleared so the next cycle starts
+        // clean.
+        //
+        // `evacuate_with_roots` itself clears mark bits. Pin cleanup
+        // is a *logical-cycle* responsibility (cycle.rs's
+        // `collect_minor`/`collect_major`/`collect_full`), because a
+        // single cycle may run multiple sub-evacs (e.g. cascade
+        // G0→G1 then G1→Tenured) that all share the conservative
+        // pin set from one pre-cycle scan. Mimic the cycle-level
+        // cleanup here with an explicit `clear_all_pins` so this
+        // test still verifies the end-of-cycle invariant.
         let mut h = small_heap();
         let chain = alloc_cons_chain(&mut h, Generation::G0, 10);
         let head = *chain.last().unwrap();
@@ -2032,8 +2088,11 @@ mod tests {
             Generation::G1,
             &mut roots,
         );
+        // Cycle-level cleanup — mirrors what `cycle.rs::collect_*`
+        // does at the end of its sub-evac sequence.
+        h.clear_all_pins();
 
-        assert_eq!(h.pinned_count(), 0, "pins cleared post-evacuate");
+        assert_eq!(h.pinned_count(), 0, "pins cleared post-cycle");
         assert_eq!(
             h.count_marked_in_gen(Generation::G0),
             0,

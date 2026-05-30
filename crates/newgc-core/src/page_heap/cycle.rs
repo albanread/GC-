@@ -207,6 +207,14 @@ impl<L: HeapLayout> PageHeap<L> {
         // to the NEW page automatically.
         self.rebuild_cards_for_old_gens();
 
+        // End-of-logical-cycle pin cleanup. Conservative pins were
+        // seeded ONCE before this call (covering G0 + G1 so the
+        // cascade sees G1 pins too); now that both sub-evacs are
+        // done, drop the per-cycle pin set so the next cycle starts
+        // clean. `apply_pins_and_extend_mark` re-folds durable
+        // explicit (FFI) pins into the next cycle.
+        self.clear_all_pins();
+
         CollectResult {
             evac: evac_result,
             cascade,
@@ -290,6 +298,13 @@ impl<L: HeapLayout> PageHeap<L> {
         // state. Both passes have completed.
         self.rebuild_cards_for_old_gens();
 
+        // End-of-logical-cycle pin cleanup. Same reasoning as
+        // `collect_minor`: the conservative pin scan ran ONCE
+        // before this call (seeding pins for all gens the cycle
+        // may touch); both sub-evacs are done, drop the per-cycle
+        // set so the next cycle starts clean.
+        self.clear_all_pins();
+
         // Reset both counters — major absorbed all pending
         // promotion debt. (Counters do not carry over from a
         // major to subsequent minors: the next minor starts a
@@ -334,17 +349,17 @@ impl<L: HeapLayout> PageHeap<L> {
     ///
     /// Both promotion counters are reset to 0 after this call.
     ///
-    /// ## Conservative-pin caveat
+    /// ## Conservative-pin behavior
     ///
-    /// `collect_full` does NOT preserve caller-supplied conservative-pin
-    /// state. Each evac pass ends with `clear_all_pins`, so a
-    /// `pin_pointers_in_ranges(Tenured, ...)` call made before
-    /// `collect_full` is wiped by pass 1's cleanup and pass 3 sees an
-    /// empty pin set. Callers that rely on conservative pinning must
-    /// supply every live object through the explicit-root closure; this
-    /// matches the contract that pass 3 "uses *only* the caller's
-    /// explicit roots." Regression coverage:
-    /// `tests/large_object.rs::vm1_collect_full_does_not_preserve_pre_pinned_tenured`.
+    /// `collect_full` PRESERVES caller-supplied conservative-pin state
+    /// across all three sub-evacs. Pin cleanup is a logical-cycle
+    /// concern (we call `clear_all_pins` once at the end, not between
+    /// passes), so a `pin_pointers_in_ranges(Tenured, ...)` call made
+    /// before `collect_full` keeps that Tenured object alive through
+    /// pass 3's compact. This matches the same fix in `collect_minor`
+    /// where the conservative pin set spans both the G0→G1 evac and
+    /// the G1→Tenured cascade. Regression coverage:
+    /// `tests/large_object.rs::vm1_collect_full_preserves_pre_pinned_tenured`.
     ///
     /// ## When to call
     ///
@@ -411,6 +426,15 @@ impl<L: HeapLayout> PageHeap<L> {
         // promotion counters. The next minor cycle starts a fresh G0
         // cohort with a clean slate.
         self.rebuild_cards_for_old_gens();
+
+        // End-of-logical-cycle pin cleanup. Three sub-evacs ran; clear
+        // the per-cycle pin set now (mirrors `collect_minor` /
+        // `collect_major`). The conservative-pin caveat above still
+        // applies: full's `pre_pinned_tenured` state is not preserved
+        // across pass 1, but that's about the pre-call state, not
+        // about pins surviving between sub-evacs.
+        self.clear_all_pins();
+
         self.minors_since_g0_promote = 0;
         self.g0_promotes_since_g1_promote = 0;
 

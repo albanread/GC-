@@ -361,24 +361,26 @@ fn vm1_large_payload_keeps_small_child_alive_across_promotion() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 10: collect_full does NOT preserve conservative-pin state on Tenured
+// Test 10: collect_full preserves pre-pinned Tenured across all three passes
 // ---------------------------------------------------------------------------
 //
-// Documented gap from the May-2026 code review (S6): collect_full performs
-// three evac passes (G0→G1, G1→Tenured, Tenured→Tenured) and each pass
-// ends by clearing the pin set. The pass-3 Tenured compact therefore runs
-// with an empty pin set — even if the caller seeded pins via
-// `pin_pointers_in_ranges(Tenured, ...)` before invoking collect_full,
-// pass 1's cleanup wipes them.
+// `collect_full` runs three sub-evacs (G0→G1, G1→Tenured, Tenured→Tenured)
+// inside one logical cycle. The conservative pin scan runs ONCE before the
+// cycle (or, here, the caller pre-pins via `pin_pointers_in_ranges`); the
+// per-cycle pin set must survive every sub-evac so the Tenured compact in
+// pass 3 honors the pin and doesn't reclaim the pre-pinned object.
 //
-// All current callers use precise roots only, so this is a feature gap
-// rather than a live bug. This test pins it down (heh) so a future change
-// that wires conservative-pin into collect_full will trip the assertion
-// and force the corresponding fix.
+// This was previously a bug: each sub-evac's `clear_all_pins` wiped the
+// pre-pin between passes, and pass 3's Tenured compact ran with an empty
+// pin set, releasing the page. The fix moved pin cleanup from per-evac to
+// per-logical-cycle (cycle.rs `collect_minor`/`collect_major`/`collect_full`
+// clear pins after all their sub-evacs complete). The same fix also closes
+// the cascade pin-loss in `collect_minor` (G0→G1 wiping G1 pins before the
+// G1→Tenured cascade) — see `tests/cons_elision_repro.rs`.
 
 #[cfg(feature = "conservative-pin")]
 #[test]
-fn vm1_collect_full_does_not_preserve_pre_pinned_tenured() {
+fn vm1_collect_full_preserves_pre_pinned_tenured() {
     let mut h = Heap::with_reservation(64 * 64 * 1024);
     // Allocate a small object in G0 and promote it to Tenured.
     let p = h.try_alloc_cons_in(Generation::G0).unwrap();
@@ -403,21 +405,26 @@ fn vm1_collect_full_does_not_preserve_pre_pinned_tenured() {
     let pin_result = h.pin_pointers_in_ranges(Generation::Tenured, &[(lo, hi)]);
     assert_eq!(pin_result.n_objects, 1, "pre-pin must register the object");
 
-    // collect_full with NO explicit roots. Pass 1's clear_all_pins wipes
-    // our pre-pin; pass 3 then sees no roots and no pins, and the Tenured
-    // object is reclaimed.
+    // collect_full with NO explicit roots. The pre-pin must survive all
+    // three sub-evacs (logical-cycle pin lifetime), so pass 3's Tenured
+    // compact keeps the pinned object in place.
     let _ = h.collect_full(|_| {});
 
-    // Document the current behavior: the Tenured page is now Free.
-    // (When a future change preserves conservative pins across collect_full,
-    // this assertion will flip and the test should be inverted.)
-    assert_eq!(
+    // The Tenured object's page should still be Tenured (pinned object
+    // stays in place, page FLIPs/keeps gen). Critically, NOT Free.
+    assert_ne!(
         h.desc(tenured_page).generation,
         Generation::Free,
-        "collect_full currently does not preserve conservative-pin state \
-         on Tenured — if this assertion starts failing, conservative-pin \
-         support has been added and the test should be updated"
+        "pre-pinned Tenured object must survive collect_full"
     );
+    // The original payload must still be intact.
+    unsafe {
+        assert_eq!(
+            Word::from_raw(*(tenured_addr as *const u64)).as_fixnum(),
+            Some(0xfeed),
+            "pre-pinned Tenured object's payload must be preserved"
+        );
+    }
 
     // Keep `stack` alive to the end of the test so the OS doesn't reuse
     // its pages and confuse the pin scanner on the next run.
