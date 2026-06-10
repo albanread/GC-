@@ -623,6 +623,23 @@ impl<L: HeapLayout> Mutator<L> {
         self.park(global, roots);
     }
 
+    /// True when a peer has requested a stop-the-world and this
+    /// mutator hasn't parked for it yet — i.e. the next
+    /// `poll_safepoint` would take the cold path. Two atomic loads,
+    /// no side effects.
+    ///
+    /// Lets a frontend skip the *preparation* for a poll (publishing
+    /// its stack window, borrowing its root set) on the
+    /// overwhelmingly common no-GC-pending path. Racing past a
+    /// just-raised epoch is benign: the request is simply observed
+    /// at the caller's next poll site, exactly as if the epoch had
+    /// been raised one instruction later.
+    #[inline]
+    pub fn safepoint_pending(&self) -> bool {
+        let global = self.shared.safepoint.epoch.load(Ordering::Acquire);
+        self.inner().last_epoch.load(Ordering::Relaxed) != global
+    }
+
     /// Cold path: park at `target` epoch until the world resumes.
     #[cold]
     fn park(&mut self, target: u64, roots: &mut [Word]) {
