@@ -152,31 +152,69 @@ pub fn is_cons_start_at(bits: &[AtomicU64], idx: usize) -> bool {
 }
 
 impl<L: HeapLayout> PageHeap<L> {
+    /// Release page `idx` back to Free and make it acquirable
+    /// again: resets the descriptor and pushes onto the O(1)
+    /// free-page list. `zeroed` records whether the caller zeroes
+    /// the page's cell memory as part of this release (within the
+    /// same exclusive borrow), letting `acquire_free_page` skip
+    /// its 64 KB safety zero on reuse.
+    ///
+    /// All transitions to `Generation::Free` MUST go through here
+    /// (not bare `desc_mut(i).release()`) or the page falls off
+    /// the free list until the debug-build fallback assert flags
+    /// it.
+    pub(crate) fn release_page_to_free(&mut self, idx: usize, zeroed: bool) {
+        if zeroed {
+            self.desc_mut(idx).release_zeroed();
+        } else {
+            self.desc_mut(idx).release();
+        }
+        self.free_page_list.push(idx);
+    }
+
     /// Find a free page and convert it to (`generation`, `kind`).
     /// Commits the page if not already committed. Returns
     /// `None` if no free pages are available (heap is full).
     ///
-    /// Sub-phase 4: O(n_pages) linear scan. Sub-phase 7 may add a
-    /// proper free-list.
+    /// O(1) amortized: pops the free-page list, discarding stale
+    /// entries (pages the contiguous large-object allocator
+    /// claimed without popping). The 64 KB bug-#4 safety zero is
+    /// skipped when the page is known zero already — freshly
+    /// OS-committed, or zeroed by the releasing GC path.
     pub(crate) fn acquire_free_page(
         &mut self,
         generation: Generation,
         kind: PageKind,
     ) -> Option<usize> {
-        let n = self.page_count();
-        // Linear scan for the first Free-generation page. Start
-        // from index 0 every time — locality matters less for the
-        // slow path than for the alloc inner loop.
         let mut found: Option<usize> = None;
-        for i in 0..n {
+        while let Some(i) = self.free_page_list.pop() {
             if self.desc(i).generation == Generation::Free {
                 found = Some(i);
                 break;
             }
+            // Stale: claimed by try_alloc_large since being
+            // pushed. Drop it and keep popping.
+        }
+        if found.is_none() {
+            // Defensive fallback: the list should be exhaustive.
+            // If a release path bypassed `release_page_to_free`,
+            // recover with the old linear scan in release builds
+            // and make debug builds fail loudly instead.
+            let n = self.page_count();
+            let scan = (0..n)
+                .find(|&i| self.desc(i).generation == Generation::Free);
+            debug_assert!(
+                scan.is_none(),
+                "page {scan:?} is Free but missing from free_page_list \
+                 — a release site bypassed release_page_to_free"
+            );
+            found = scan;
         }
         let idx = found?;
-        // Commit the page if needed.
-        self.commit_page(idx).ok()?;
+        // Commit the page if needed. `true` ⇒ this call performed
+        // the OS commit and the memory is guaranteed zero.
+        let freshly_zeroed = self.commit_page(idx).ok()?;
+        let already_zero = freshly_zeroed || self.desc(idx).zeroed;
         // Assign generation / kind via desc_mut.
         *self.desc_mut(idx) = PageDesc::fresh(generation, kind);
         // Bug #1 from the code review (docs/GC_DESIGN.md sub-phase
@@ -203,15 +241,19 @@ impl<L: HeapLayout> PageHeap<L> {
         // recycled after GC contains forwarding-marker leftovers
         // and prior live data; reading those as Words from a
         // partially-initialised object's payload returns garbage
-        // that propagates through the JIT'd code. Fresh
-        // VirtualAlloc'd pages get zero-init for free; recycled
-        // pages must be zeroed here.
-        unsafe {
-            std::ptr::write_bytes(
-                self.page_ptr(idx),
-                0,
-                super::space::PAGE_SIZE_BYTES,
-            );
+        // that propagates through the JIT'd code.
+        //
+        // Skipped when the memory is provably zero already: the
+        // OS zero-filled it on this call's commit, or the GC
+        // release path zeroed it (`release_page_to_free(_, true)`).
+        if !already_zero {
+            unsafe {
+                std::ptr::write_bytes(
+                    self.page_ptr(idx),
+                    0,
+                    super::space::PAGE_SIZE_BYTES,
+                );
+            }
         }
         Some(idx)
     }
@@ -474,7 +516,8 @@ impl<L: HeapLayout> PageHeap<L> {
         // Commit and stamp all pages in the run.
         for i in 0..n_pages {
             let idx = start_idx + i;
-            self.commit_page(idx).ok()?;
+            let freshly_zeroed = self.commit_page(idx).ok()?;
+            let already_zero = freshly_zeroed || self.desc(idx).zeroed;
             let mut d = super::page_desc::PageDesc::fresh(generation, super::page_desc::PageKind::Large);
             d.words_used = PAGE_SIZE_CELLS as u16;
             if i == 0 {
@@ -485,9 +528,13 @@ impl<L: HeapLayout> PageHeap<L> {
             *self.desc_mut(idx) = d;
             // Zero the page cells to clear any stale forwarding markers
             // from a prior tenant (same as acquire_free_page bug-fix #4).
-            unsafe {
-                let page_base = self.page_ptr(idx) as *mut u64;
-                std::ptr::write_bytes(page_base, 0, PAGE_SIZE_CELLS);
+            // Skipped when provably zero (fresh OS commit / zeroing
+            // release path) — same gate as acquire_free_page.
+            if !already_zero {
+                unsafe {
+                    let page_base = self.page_ptr(idx) as *mut u64;
+                    std::ptr::write_bytes(page_base, 0, PAGE_SIZE_CELLS);
+                }
             }
             // Clear stale start bits for this page.
             let first_word = idx * WORDS_PER_PAGE;
@@ -806,8 +853,10 @@ mod tests {
             "fresh cons must have its start bit set"
         );
         // Manually release the page (simulates sub-phase 7 freeing
-        // an evacuated page back to the Free pool).
-        h.desc_mut(page_idx).release();
+        // an evacuated page back to the Free pool). Goes through
+        // release_page_to_free — the invariant all release sites
+        // must follow now that acquire pops the free-page list.
+        h.release_page_to_free(page_idx, false);
         // Reset the corresponding alloc region so the next acquire
         // doesn't try to re-use the now-Free page through the
         // cached current_page pointer.

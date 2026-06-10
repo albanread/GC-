@@ -140,8 +140,9 @@ impl PageKind {
     }
 }
 
-/// Per-page metadata. Twelve bytes per page; one entry in the
-/// parallel `Vec<PageDesc>` owned by `PageHeap`.
+/// Per-page metadata. Thirteen bytes used (16 with padding) per
+/// page; one entry in the parallel `Vec<PageDesc>` owned by
+/// `PageHeap`.
 ///
 /// Layout (with `#[repr(C)]`, fields ordered for natural alignment):
 ///
@@ -153,7 +154,8 @@ impl PageKind {
 ///   offset 8   pin_byte           u8    (1 byte)
 ///   offset 9   age                u8    (1 byte)
 ///   offset 10  n_span             u16   (2 bytes)
-///   total                              = 12 bytes
+///   offset 12  zeroed             bool  (1 byte)
+///   total                              = 13 bytes (+3 pad)
 /// ```
 ///
 /// `words_used` is 16 bits — page is 8192 cells = 13 bits; 16-bit
@@ -194,6 +196,14 @@ pub struct PageDesc {
     /// number of pages in the run), `0` on continuation pages. `0` for `Free`
     /// pages. Used by Sprint VM-1 large-object allocation and evacuation.
     pub n_span: u16,
+    /// Only meaningful while `generation == Free`: true when the
+    /// page's cell memory is known to be all-zero (the release
+    /// path zeroed it, e.g. evacuation's post-release
+    /// `zero_whole_page`). Lets `acquire_free_page` skip its
+    /// 64 KB safety zero (GC_DESIGN bug #4) when the work was
+    /// already done. Freshly OS-committed pages are also zero,
+    /// but that case is reported by `commit_page` directly.
+    pub zeroed: bool,
 }
 
 impl PageDesc {
@@ -207,6 +217,10 @@ impl PageDesc {
         pin_byte: 0,
         age: 0,
         n_span: 0,
+        // Conservative default: unknown contents ⇒ the next
+        // `acquire_free_page` must zero. Release paths that zero
+        // use `release_zeroed`.
+        zeroed: false,
     };
 
     /// Construct a fresh page descriptor for a page just assigned
@@ -225,6 +239,9 @@ impl PageDesc {
                 PageKind::Cons | PageKind::Boxed => 1,
                 _ => 0, // Free and Large start at 0; Large head pages set n_span explicitly after calling fresh()
             },
+            // In-use pages don't track zeroed-ness; the flag is
+            // re-derived at release time.
+            zeroed: false,
         }
     }
 
@@ -232,6 +249,14 @@ impl PageDesc {
     /// Called when evacuation reclaims an empty page.
     pub fn release(&mut self) {
         *self = PageDesc::FREE;
+    }
+
+    /// Like `release`, but records that the caller zeroed (or is
+    /// about to zero, within the same exclusive borrow) the page's
+    /// cell memory, so re-acquisition can skip its safety zero.
+    pub fn release_zeroed(&mut self) {
+        *self = PageDesc::FREE;
+        self.zeroed = true;
     }
 
     /// Test whether any sub-region of this page is pinned. Used
@@ -279,8 +304,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn page_desc_is_twelve_bytes() {
-        assert_eq!(std::mem::size_of::<PageDesc>(), 12);
+    fn page_desc_is_sixteen_bytes() {
+        // 13 bytes of fields (the `zeroed` flag took offset 12)
+        // padded to 16 by the u32's 4-byte alignment.
+        assert_eq!(std::mem::size_of::<PageDesc>(), 16);
     }
 
     #[test]

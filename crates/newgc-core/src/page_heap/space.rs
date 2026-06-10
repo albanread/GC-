@@ -123,6 +123,19 @@ pub struct PageHeap<L: HeapLayout> {
     /// can mutate descriptors directly during their own passes
     /// without going through accessor methods.
     pub(super) descs: Vec<PageDesc>,
+    /// Stack of page indices believed Free — the O(1) source for
+    /// `acquire_free_page` (which previously linear-scanned all
+    /// descriptors per TLAB refill). Invariant: every page whose
+    /// descriptor transitions to `Generation::Free` is pushed
+    /// (`release_page_to_free`); seeded with all pages at
+    /// construction. Entries can go stale — the contiguous
+    /// large-object allocator claims Free pages without popping
+    /// them — so consumers pop-and-validate against the
+    /// descriptor, discarding entries that are no longer Free.
+    /// A page can briefly appear twice (released, claimed by a
+    /// large run, released again); the validate step makes the
+    /// duplicate harmless.
+    pub(super) free_page_list: Vec<usize>,
     /// Open allocation regions, one per (generation, kind). Indexed
     /// by `(generation_idx, kind_idx)` — see `region_index` for
     /// the encoding. Sub-phase 4 supports `Cons` and `Boxed`
@@ -423,6 +436,7 @@ impl<L: HeapLayout> PageHeap<L> {
                 committed_count: AtomicUsize::new(0),
                 commit_lock: Mutex::new(()),
                 descs,
+                free_page_list: (0..n_pages).rev().collect(),
                 alloc_regions,
                 shared,
                 mark_bits,
@@ -477,6 +491,7 @@ impl<L: HeapLayout> PageHeap<L> {
                 committed_count: AtomicUsize::new(0),
                 commit_lock: Mutex::new(()),
                 descs,
+                free_page_list: (0..n_pages).rev().collect(),
                 alloc_regions,
                 shared,
                 mark_bits,
@@ -517,6 +532,7 @@ impl<L: HeapLayout> PageHeap<L> {
                 committed_count: AtomicUsize::new(n_pages),
                 commit_lock: Mutex::new(()),
                 descs,
+                free_page_list: (0..n_pages).rev().collect(),
                 alloc_regions,
                 shared,
                 mark_bits,
@@ -963,13 +979,20 @@ impl<L: HeapLayout> PageHeap<L> {
     /// longer lock it inside these methods. Sub-phase 7 routinely
     /// decommits empty pages, so this protection becomes load-
     /// bearing then.
-    pub fn commit_page(&mut self, idx: usize) -> Result<(), CommitError> {
+    /// Returns `Ok(true)` when this call performed the OS commit —
+    /// in which case the page's memory is guaranteed all-zero
+    /// (Windows `MEM_COMMIT` zero-fills, as does first-touch after
+    /// the unix `madvise(MADV_DONTNEED)`/initial `PROT_NONE` mmap).
+    /// `Ok(false)` means the page was already committed and may
+    /// hold a prior tenant's bytes. The Box-backed fallback
+    /// pre-fills the commit bitmap, so it always reports `false`.
+    pub fn commit_page(&mut self, idx: usize) -> Result<bool, CommitError> {
         if idx >= self.n_pages {
             return Err(CommitError::OutOfRange(idx));
         }
         // Idempotent — already committed.
         if self.is_committed(idx) {
-            return Ok(());
+            return Ok(false);
         }
         #[cfg(windows)]
         {
@@ -1010,7 +1033,11 @@ impl<L: HeapLayout> PageHeap<L> {
         let bit = 1u64 << (idx % 64);
         self.committed_bits[word_idx].fetch_or(bit, Ordering::AcqRel);
         self.committed_count.fetch_add(1, Ordering::AcqRel);
-        Ok(())
+        // Zero-fill is an OS guarantee — only the windows/unix
+        // paths above actually ran a syscall. On the Box-backed
+        // fallback a decommit/recommit round-trip moves no memory,
+        // so the prior bytes survive and we must report false.
+        Ok(cfg!(any(windows, unix)))
     }
 
     /// Decommit page `idx`, returning its backing memory to the

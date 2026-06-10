@@ -399,7 +399,10 @@ impl<L: HeapLayout> PageHeap<L> {
 
         self.last_zero_live_pages_released = releasable.len();
         for page_idx in releasable {
-            self.desc_mut(page_idx).release();
+            // `zeroed = false`: this path frees pages whose objects
+            // are all dead but whose bytes are untouched — the next
+            // `acquire_free_page` must run its safety zero.
+            self.release_page_to_free(page_idx, false);
             self.recycle_live_counts[page_idx] = 0;
         }
     }

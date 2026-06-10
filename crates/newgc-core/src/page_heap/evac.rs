@@ -1307,7 +1307,7 @@ impl<L: HeapLayout> PageHeap<L> {
                         let pidx = page_idx + i;
                         clear_page_start_bits(self.start_bits_slice(), pidx);
                         zero_whole_page(self, pidx);
-                        self.desc_mut(pidx).release();
+                        self.release_page_to_free(pidx, true);
                         if self.is_committed(pidx) {
                             let _ = self.decommit_page(pidx);
                         }
@@ -1412,7 +1412,10 @@ impl<L: HeapLayout> PageHeap<L> {
                 // release and the next `acquire_free_page` reads
                 // Fixnum 0 instead of a forward marker (or live-
                 // looking bytes from the just-copied object).
-                self.desc_mut(page_idx).release();
+                // (`zeroed = true`: the zero two lines down happens
+                // inside this same exclusive borrow, before any
+                // mutator can re-acquire the page.)
+                self.release_page_to_free(page_idx, true);
                 clear_page_start_bits(self.start_bits_slice(), page_idx);
                 zero_whole_page(self, page_idx);
                 released += 1;
