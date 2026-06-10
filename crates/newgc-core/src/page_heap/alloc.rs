@@ -211,6 +211,11 @@ impl<L: HeapLayout> PageHeap<L> {
             found = scan;
         }
         let idx = found?;
+        // Extend the touched-prefix bound so the per-cycle O(n_pages)
+        // sweeps know this page is now live.
+        if idx + 1 > self.pages_high_water {
+            self.pages_high_water = idx + 1;
+        }
         // Commit the page if needed. `true` ⇒ this call performed
         // the OS commit and the memory is guaranteed zero.
         let freshly_zeroed = self.commit_page(idx).ok()?;
@@ -508,6 +513,11 @@ impl<L: HeapLayout> PageHeap<L> {
 
         // Find the first run of n_pages contiguous Free pages.
         let start_idx = self.find_contiguous_free_pages(n_pages)?;
+
+        // Extend the touched-prefix bound to cover the whole run.
+        if start_idx + n_pages > self.pages_high_water {
+            self.pages_high_water = start_idx + n_pages;
+        }
 
         // Cells per start-bits word (2 bits per cell).
         const CELLS_PER_STARTS_WORD: usize = 32;

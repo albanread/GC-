@@ -136,6 +136,17 @@ pub struct PageHeap<L: HeapLayout> {
     /// large run, released again); the validate step makes the
     /// duplicate harmless.
     pub(super) free_page_list: Vec<usize>,
+    /// `1 + (max page index ever transitioned out of Free)`, i.e. an
+    /// upper bound on the touched prefix of the reservation. Pages at
+    /// index `>= pages_high_water` have never been acquired, so they
+    /// are still Free with start-bits and cards untouched since
+    /// construction (all-zero). Monotonic — only grows — so it stays
+    /// a valid bound even after pages are released. Lets the
+    /// per-cycle O(n_pages) sweeps (card rebuild, descriptor scans)
+    /// iterate `0..pages_high_water` instead of the full 2 GB
+    /// reservation (~32K pages), which is the ~9 ms fixed floor of
+    /// every minor on a near-empty heap.
+    pub(super) pages_high_water: usize,
     /// Open allocation regions, one per (generation, kind). Indexed
     /// by `(generation_idx, kind_idx)` — see `region_index` for
     /// the encoding. Sub-phase 4 supports `Cons` and `Boxed`
@@ -437,6 +448,7 @@ impl<L: HeapLayout> PageHeap<L> {
                 commit_lock: Mutex::new(()),
                 descs,
                 free_page_list: (0..n_pages).rev().collect(),
+                pages_high_water: 0,
                 alloc_regions,
                 shared,
                 mark_bits,
@@ -492,6 +504,7 @@ impl<L: HeapLayout> PageHeap<L> {
                 commit_lock: Mutex::new(()),
                 descs,
                 free_page_list: (0..n_pages).rev().collect(),
+                pages_high_water: 0,
                 alloc_regions,
                 shared,
                 mark_bits,
@@ -533,6 +546,7 @@ impl<L: HeapLayout> PageHeap<L> {
                 commit_lock: Mutex::new(()),
                 descs,
                 free_page_list: (0..n_pages).rev().collect(),
+                pages_high_water: 0,
                 alloc_regions,
                 shared,
                 mark_bits,
@@ -869,15 +883,19 @@ impl<L: HeapLayout> PageHeap<L> {
     /// some carry-over heuristic — that approach loses card-marks
     /// when objects move between pages during evacuation.
     ///
-    /// Cost: iterates only committed pages in the target
-    /// generations, so it scales with live old-gen data, not total
-    /// reservation size. For our workloads (single-digit MB of old
-    /// gen) this is ~100K cell reads per cycle, completing in
-    /// microseconds.
+    /// Cost: iterates the *touched prefix* of the reservation
+    /// (`0..pages_high_water`), not the full 2 GB reservation. Pages
+    /// at index `>= pages_high_water` were never acquired, so their
+    /// cards are still all-zero from construction and need no
+    /// clearing. Before this bound, sweeping all ~32K mostly-Free
+    /// reservation pages (128 card-clears each) was the ~9 ms fixed
+    /// floor of every minor on a near-empty heap. The per-cell
+    /// pointer scan over the *live* pages within the prefix remains —
+    /// that is the live-proportional part of the pause.
     pub(super) fn rebuild_cards_for_old_gens(&self) {
         let base = self.storage.base() as *const u64;
         let cards_per_page = PAGE_SIZE_BYTES / crate::heap_common::CARD_SIZE_BYTES;
-        for page_idx in 0..self.n_pages {
+        for page_idx in 0..self.pages_high_water {
             let page_gen = self.descs[page_idx].generation;
             if matches!(page_gen, Generation::Free) {
                 // Free pages: clear all cards. The cells are zeroed
