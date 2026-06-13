@@ -912,8 +912,29 @@ impl<L: HeapLayout> PageHeap<L> {
             // G0 cards to find G0→G1 cross-gen pointers; clearing
             // them unconditionally would lose those pointers.
             // Minor cycles skip G0 cards via the page filter.
+            //
+            // Only scan the cards covering the page's *used* extent
+            // (`words_used`). A page is bump-allocated from cell 0, so no
+            // live object — hence no cross-gen pointer — exists at or
+            // beyond `words_used`; cards past it cover only
+            // never-written / dead cells and are simply cleared without
+            // touching memory. evac (`evac.rs` first_cell+words_used) and
+            // mark (`mark.rs` first_cell+words_used) already bound their
+            // scans the same way; this makes the card rebuild match,
+            // turning a full-page (8192-cell) classify on a 1%-live
+            // Tenured page into a words_used-proportional one.
             let page_base_cell = page_idx * PAGE_SIZE_CELLS;
+            let words_used = self.descs[page_idx].words_used as usize;
+            let used_cards =
+                words_used.div_ceil(crate::heap_common::CARD_SIZE_CELLS);
             for card_offset_in_page in 0..cards_per_page {
+                let card_idx =
+                    page_idx * cards_per_page + card_offset_in_page;
+                if card_offset_in_page >= used_cards {
+                    // Entirely beyond the live extent — no pointers.
+                    self.shared.cards.clear(card_idx);
+                    continue;
+                }
                 let card_first_cell = page_base_cell
                     + card_offset_in_page
                         * crate::heap_common::CARD_SIZE_CELLS;
@@ -931,8 +952,6 @@ impl<L: HeapLayout> PageHeap<L> {
                         break;
                     }
                 }
-                let card_idx =
-                    page_idx * cards_per_page + card_offset_in_page;
                 if has_heap_pointer {
                     self.shared.cards
                         .mark_offset(card_first_cell * 8);
